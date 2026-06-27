@@ -576,6 +576,11 @@ async def calibration():
     }
 
 
+@app.get("/")
+async def root():
+    return {"service": "TradeOdds API", "status": "ok", "docs": "/docs"}
+
+
 @app.get("/health")
 async def health():
     return {
