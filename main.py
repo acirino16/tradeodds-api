@@ -17,9 +17,12 @@ import pandas as pd
 from datetime import datetime, timedelta
 import math
 import time
+import os
 import requests
 import warnings
 warnings.filterwarnings("ignore")
+
+TWELVEDATA_KEY = os.environ.get("TWELVEDATA_KEY", "")
 
 # Session with browser-like headers to avoid Yahoo Finance rate limiting
 _session = requests.Session()
@@ -335,23 +338,44 @@ def get_fundamentals(ticker: str) -> dict:
 
 
 # ── Price momentum features ───────────────────────────────────────────────────
-def price_features(ticker: str) -> dict:
-    # Use fast_info for the real-time current price — avoids stale historical data
+def get_live_price(ticker: str) -> float:
+    """
+    Fetch real-time price from Twelve Data (primary) with yfinance fast_info fallback.
+    Twelve Data free tier: 800 calls/day, always returns today's price.
+    """
+    # Primary: Twelve Data
+    if TWELVEDATA_KEY:
+        try:
+            r = _session.get(
+                "https://api.twelvedata.com/price",
+                params={"symbol": ticker, "apikey": TWELVEDATA_KEY},
+                timeout=8,
+            )
+            data = r.json()
+            price = float(data.get("price", 0))
+            if price > 0:
+                return price
+        except Exception:
+            pass
+
+    # Fallback: yfinance fast_info
     try:
         fi = yf.Ticker(ticker, session=_session).fast_info
-        cur = float(fi.last_price)
-        if not cur or cur <= 0:
-            raise ValueError("bad fast_info price")
+        price = float(fi.last_price)
+        if price > 0:
+            return price
     except Exception:
-        # Fallback: last close from recent download
-        try:
-            tmp = yf.download(ticker, period="5d", progress=False,
-                              auto_adjust=True, session=_session)
-            cur = float(tmp["Close"].iloc[-1])
-        except Exception:
-            return {"current_price": 0, "mom_1m": 0, "mom_3m": 0, "mom_6m": 0, "mom_12m": 0}
+        pass
 
-    # Historical prices for momentum (use longer window, iloc[-1] is NOT used for current price)
+    return 0.0
+
+
+def price_features(ticker: str) -> dict:
+    cur = get_live_price(ticker)
+    if cur <= 0:
+        return {"current_price": 0, "mom_1m": 0, "mom_3m": 0, "mom_6m": 0, "mom_12m": 0}
+
+    # Historical prices for momentum only — current price always comes from get_live_price
     prices = fetch_prices(ticker, "1y")
     if len(prices) < 30:
         return {"current_price": round(cur, 2), "mom_1m": 0, "mom_3m": 0, "mom_6m": 0, "mom_12m": 0}
