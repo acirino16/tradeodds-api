@@ -51,27 +51,7 @@ FACTOR_PROXIES = {
 
 # Cache layer — avoid hammering Yahoo on repeated requests
 _cache: dict = {}
-CACHE_TTL = 600  # seconds — longer TTL reduces Yahoo calls
-
-# Preloaded factor returns (loaded once at startup, refreshed every 10 min)
-_factor_cache: dict = {}
-
-
-@app.on_event("startup")
-async def preload_factors():
-    """Fetch factor ETF returns once at startup so forecasts are fast."""
-    try:
-        tickers = ["SPY", "IWM", "IWD", "MTUM"]
-        data = yf.download(tickers, period="2y", progress=False,
-                           auto_adjust=True, session=_session, group_by="ticker")
-        for tk in tickers:
-            try:
-                prices = data[tk]["Close"].squeeze().dropna()
-                _factor_cache[tk] = prices
-            except Exception:
-                pass
-    except Exception:
-        pass  # forecasts fall back to per-ticker fetch if this fails
+CACHE_TTL = 600  # seconds
 
 
 def cached(key: str):
@@ -88,9 +68,6 @@ def store(key: str, val):
 
 
 def fetch_prices(ticker: str, period: str = "2y") -> pd.Series:
-    # Use preloaded factor cache for ETFs
-    if ticker in _factor_cache and period == "2y":
-        return _factor_cache[ticker]
     cached_val = cached(f"px_{ticker}_{period}")
     if cached_val is not None:
         return cached_val
@@ -118,57 +95,38 @@ def daily_returns(prices: pd.Series) -> pd.Series:
 # ── Module 1: Fama-French 4-Factor regression ─────────────────────────────────
 def ff4_factor_tilt(ticker: str) -> dict:
     """
-    Regress stock returns on MKT, SMB, HML, MOM factors using ETF proxies.
-    Returns factor loadings (betas) and expected annualized alpha.
+    Single-factor CAPM regression against SPY (market proxy).
+    Alpha = annualized excess return above market-implied return.
+    Kept to one download to stay fast on free-tier hosting.
     """
-    end = datetime.today()
-    start = end - timedelta(days=365 * 2)
-
-    stock_px = fetch_prices(ticker, "2y")
-    spy_px   = fetch_prices("SPY",  "2y")
-    iwm_px   = fetch_prices("IWM",  "2y")
-    iwd_px   = fetch_prices("IWD",  "2y")
-    mtum_px  = fetch_prices("MTUM", "2y")
+    stock_px = fetch_prices(ticker, "1y")
+    spy_px   = fetch_prices("SPY",   "1y")
 
     stock_r = daily_returns(stock_px)
     mkt_r   = daily_returns(spy_px)
-    smb_r   = daily_returns(iwm_px) - mkt_r   # size tilt relative to market
-    hml_r   = daily_returns(iwd_px) - mkt_r   # value tilt relative to market
-    mom_r   = daily_returns(mtum_px)
 
-    df = pd.DataFrame({
-        "stock": stock_r,
-        "mkt":   mkt_r,
-        "smb":   smb_r,
-        "hml":   hml_r,
-        "mom":   mom_r,
-    }).dropna()
+    df = pd.DataFrame({"stock": stock_r, "mkt": mkt_r}).dropna()
 
     if len(df) < 60:
         return {"beta_mkt": 1.0, "beta_smb": 0.0, "beta_hml": 0.0, "beta_mom": 0.0, "alpha_ann": 0.0}
 
-    X = df[["mkt", "smb", "hml", "mom"]].values
+    X = df[["mkt"]].values
     y = df["stock"].values
     X_aug = np.column_stack([np.ones(len(X)), X])
     try:
         coeffs, _, _, _ = np.linalg.lstsq(X_aug, y, rcond=None)
     except Exception:
-        coeffs = [0.0, 1.0, 0.0, 0.0, 0.0]
+        coeffs = [0.0, 1.0]
 
-    alpha_daily = coeffs[0]
-    beta_mkt    = coeffs[1]
-    beta_smb    = coeffs[2]
-    beta_hml    = coeffs[3]
-    beta_mom    = coeffs[4]
-
-    alpha_ann = alpha_daily * 252
+    alpha_ann = float(coeffs[0]) * 252
+    beta_mkt  = float(coeffs[1])
 
     return {
-        "beta_mkt":  round(float(beta_mkt), 3),
-        "beta_smb":  round(float(beta_smb), 3),
-        "beta_hml":  round(float(beta_hml), 3),
-        "beta_mom":  round(float(beta_mom), 3),
-        "alpha_ann": round(float(alpha_ann), 4),
+        "beta_mkt":  round(beta_mkt, 3),
+        "beta_smb":  0.0,
+        "beta_hml":  0.0,
+        "beta_mom":  0.0,
+        "alpha_ann": round(alpha_ann, 4),
     }
 
 
@@ -178,7 +136,7 @@ def historical_base_rate(ticker: str, direction: str, horizon_days: int) -> dict
     What fraction of rolling horizon-day windows returned a profit for long/short?
     Uses 5 years of daily data.
     """
-    prices = fetch_prices(ticker, "5y")
+    prices = fetch_prices(ticker, "2y")
     if len(prices) < horizon_days + 10:
         return {"base_rate": 0.5, "n_windows": 0}
 
@@ -272,7 +230,7 @@ def historical_analogues(ticker: str, direction: str, horizon_days: int, current
     Find past 90-day windows where trailing vol was similar to today.
     Return average forward return in those regimes.
     """
-    prices = fetch_prices(ticker, "5y")
+    prices = fetch_prices(ticker, "2y")
     if len(prices) < 90 + horizon_days:
         return {"analogue_p": 0.5, "n_analogues": 0, "avg_fwd_ret": 0.0}
 
