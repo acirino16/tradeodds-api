@@ -51,7 +51,27 @@ FACTOR_PROXIES = {
 
 # Cache layer — avoid hammering Yahoo on repeated requests
 _cache: dict = {}
-CACHE_TTL = 300  # seconds
+CACHE_TTL = 600  # seconds — longer TTL reduces Yahoo calls
+
+# Preloaded factor returns (loaded once at startup, refreshed every 10 min)
+_factor_cache: dict = {}
+
+
+@app.on_event("startup")
+async def preload_factors():
+    """Fetch factor ETF returns once at startup so forecasts are fast."""
+    try:
+        tickers = ["SPY", "IWM", "IWD", "MTUM"]
+        data = yf.download(tickers, period="2y", progress=False,
+                           auto_adjust=True, session=_session, group_by="ticker")
+        for tk in tickers:
+            try:
+                prices = data[tk]["Close"].squeeze().dropna()
+                _factor_cache[tk] = prices
+            except Exception:
+                pass
+    except Exception:
+        pass  # forecasts fall back to per-ticker fetch if this fails
 
 
 def cached(key: str):
@@ -68,6 +88,9 @@ def store(key: str, val):
 
 
 def fetch_prices(ticker: str, period: str = "2y") -> pd.Series:
+    # Use preloaded factor cache for ETFs
+    if ticker in _factor_cache and period == "2y":
+        return _factor_cache[ticker]
     cached_val = cached(f"px_{ticker}_{period}")
     if cached_val is not None:
         return cached_val
@@ -76,15 +99,15 @@ def fetch_prices(ticker: str, period: str = "2y") -> pd.Series:
             data = yf.download(ticker, period=period, progress=False,
                                auto_adjust=True, session=_session)
             if data.empty:
-                time.sleep(1.5 * (attempt + 1))
+                time.sleep(1.0 * (attempt + 1))
                 continue
-            prices = data["Close"].squeeze()
+            prices = data["Close"].squeeze().dropna()
             if prices.empty or float(prices.iloc[-1]) <= 0:
-                time.sleep(1.5 * (attempt + 1))
+                time.sleep(1.0 * (attempt + 1))
                 continue
             return store(f"px_{ticker}_{period}", prices)
         except Exception:
-            time.sleep(1.5 * (attempt + 1))
+            time.sleep(1.0 * (attempt + 1))
     raise HTTPException(502, f"Could not fetch price data for {ticker} after 3 attempts")
 
 
