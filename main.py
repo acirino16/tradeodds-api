@@ -355,16 +355,32 @@ def get_fundamentals(ticker: str) -> dict:
 
 # ── Price momentum features ───────────────────────────────────────────────────
 def price_features(ticker: str) -> dict:
+    # Use fast_info for the real-time current price — avoids stale historical data
+    try:
+        fi = yf.Ticker(ticker, session=_session).fast_info
+        cur = float(fi.last_price)
+        if not cur or cur <= 0:
+            raise ValueError("bad fast_info price")
+    except Exception:
+        # Fallback: last close from recent download
+        try:
+            tmp = yf.download(ticker, period="5d", progress=False,
+                              auto_adjust=True, session=_session)
+            cur = float(tmp["Close"].iloc[-1])
+        except Exception:
+            return {"current_price": 0, "mom_1m": 0, "mom_3m": 0, "mom_6m": 0, "mom_12m": 0}
+
+    # Historical prices for momentum (use longer window, iloc[-1] is NOT used for current price)
     prices = fetch_prices(ticker, "1y")
     if len(prices) < 30:
-        return {"current_price": 0, "mom_1m": 0, "mom_3m": 0, "mom_6m": 0, "mom_12m": 0}
+        return {"current_price": round(cur, 2), "mom_1m": 0, "mom_3m": 0, "mom_6m": 0, "mom_12m": 0}
 
     px = prices.values
-    cur = float(px[-1])
 
     def safe_mom(n):
         idx = max(0, len(px) - n)
-        return round((cur - float(px[idx])) / float(px[idx]), 4) if float(px[idx]) > 0 else 0.0
+        base = float(px[idx])
+        return round((cur - base) / base, 4) if base > 0 else 0.0
 
     return {
         "current_price": round(cur, 2),
