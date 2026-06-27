@@ -16,8 +16,20 @@ import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
 import math
+import time
+import requests
 import warnings
 warnings.filterwarnings("ignore")
+
+# Session with browser-like headers to avoid Yahoo Finance rate limiting
+_session = requests.Session()
+_session.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+})
 
 app = FastAPI(title="TradeOdds API", version="1.0.0")
 
@@ -59,9 +71,21 @@ def fetch_prices(ticker: str, period: str = "2y") -> pd.Series:
     cached_val = cached(f"px_{ticker}_{period}")
     if cached_val is not None:
         return cached_val
-    data = yf.download(ticker, period=period, progress=False, auto_adjust=True)
-    prices = data["Close"].squeeze()
-    return store(f"px_{ticker}_{period}", prices)
+    for attempt in range(3):
+        try:
+            data = yf.download(ticker, period=period, progress=False,
+                               auto_adjust=True, session=_session)
+            if data.empty:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            prices = data["Close"].squeeze()
+            if prices.empty or float(prices.iloc[-1]) <= 0:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            return store(f"px_{ticker}_{period}", prices)
+        except Exception:
+            time.sleep(1.5 * (attempt + 1))
+    raise HTTPException(502, f"Could not fetch price data for {ticker} after 3 attempts")
 
 
 def daily_returns(prices: pd.Series) -> pd.Series:
@@ -78,9 +102,9 @@ def ff4_factor_tilt(ticker: str) -> dict:
     start = end - timedelta(days=365 * 2)
 
     stock_px = fetch_prices(ticker, "2y")
-    spy_px   = fetch_prices("SPY", "2y")
-    iwm_px   = fetch_prices("IWM", "2y")
-    iwd_px   = fetch_prices("IWD", "2y")
+    spy_px   = fetch_prices("SPY",  "2y")
+    iwm_px   = fetch_prices("IWM",  "2y")
+    iwd_px   = fetch_prices("IWD",  "2y")
     mtum_px  = fetch_prices("MTUM", "2y")
 
     stock_r = daily_returns(stock_px)
@@ -294,7 +318,7 @@ def get_fundamentals(ticker: str) -> dict:
         return cached_val
 
     try:
-        info = yf.Ticker(ticker).info
+        info = yf.Ticker(ticker, session=_session).info
     except Exception:
         info = {}
 
