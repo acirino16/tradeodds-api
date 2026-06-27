@@ -1,12 +1,16 @@
 """
-TradeOdds API — Proprietary Prediction Engine
-Model stack:
-  1. Fama-French 4-Factor (Market, SMB, HML, MOM) — factor tilt on expected return
-  2. Historical base rate — rolling win-rate over matched lookback windows
-  3. Monte Carlo GBM — 10,000 terminal-price paths with factor-implied drift
-  4. VIX/Beta-derived implied volatility — proxy for options-implied move
-  5. Historical analogues — nearest-neighbor return periods by vol regime
-  6. Ensemble blend — probability-weighted average of all modules
+TradeOdds API v2 — Proprietary 7-Factor Prediction Engine
+========================================================
+Factor Stack:
+  1. Technical & Price Dynamics    — RSI, MA, momentum, volume trend
+  2. Market Factor Regression      — CAPM alpha + beta vs SPY
+  3. Fundamental Quality Score     — margins, ROE, growth, value, safety
+  4. Modern Company Factors        — R&D intensity, intangibles, platform economics
+  5. Sentiment & Positioning       — short interest, analyst consensus, insider flow
+  6. Macro Regime                  — VIX, yield curve, SPY trend → conditional weights
+  7. Volatility Surface            — realized vol, vol-of-vol, fat-tailed Monte Carlo
+
+Data: Twelve Data (live price + OHLCV) + yfinance (fundamentals + macro)
 """
 
 from fastapi import FastAPI, HTTPException, Query
@@ -14,336 +18,45 @@ from fastapi.middleware.cors import CORSMiddleware
 import yfinance as yf
 import numpy as np
 import pandas as pd
-from datetime import datetime, timedelta
-import math
-import time
-import os
-import requests
-import warnings
+from datetime import datetime
+import math, time, os, requests, warnings
+
 warnings.filterwarnings("ignore")
 
 TWELVEDATA_KEY = os.environ.get("TWELVEDATA_KEY", "")
 
-# Session with browser-like headers to avoid Yahoo Finance rate limiting
-_session = requests.Session()
-_session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-})
-
-app = FastAPI(title="TradeOdds API", version="1.0.0")
-
+app = FastAPI(title="TradeOdds API", version="2.0.0")
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["GET"],
-    allow_headers=["*"],
+    CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], allow_headers=["*"]
 )
 
-# ── Factor proxies (ETFs as free Fama-French factor proxies) ──────────────────
-FACTOR_PROXIES = {
-    "MKT": "SPY",   # Market
-    "SMB": "IWM",   # Small-minus-big proxy (Russell 2000)
-    "HML": "IWD",   # High-minus-low (value ETF)
-    "MOM": "MTUM",  # Momentum factor ETF
-    "VIX": "^VIX",
-}
+_session = requests.Session()
+_session.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
+})
 
-# Cache layer — avoid hammering Yahoo on repeated requests
+# ── Cache ──────────────────────────────────────────────────────────────────────
 _cache: dict = {}
-CACHE_TTL = 600  # seconds
 
-
-def cached(key: str):
+def cached(key: str, ttl: int = 600):
     if key in _cache:
         val, ts = _cache[key]
-        if (datetime.utcnow() - ts).seconds < CACHE_TTL:
+        if (datetime.utcnow() - ts).seconds < ttl:
             return val
     return None
-
 
 def store(key: str, val):
     _cache[key] = (val, datetime.utcnow())
     return val
 
 
-def fetch_prices(ticker: str, period: str = "2y") -> pd.Series:
-    cached_val = cached(f"px_{ticker}_{period}")
-    if cached_val is not None:
-        return cached_val
-    for attempt in range(3):
-        try:
-            data = yf.download(ticker, period=period, progress=False,
-                               auto_adjust=True, session=_session)
-            if data.empty:
-                time.sleep(1.0 * (attempt + 1))
-                continue
-            prices = data["Close"].squeeze().dropna()
-            if prices.empty or float(prices.iloc[-1]) <= 0:
-                time.sleep(1.0 * (attempt + 1))
-                continue
-            return store(f"px_{ticker}_{period}", prices)
-        except Exception:
-            time.sleep(1.0 * (attempt + 1))
-    raise HTTPException(502, f"Could not fetch price data for {ticker} after 3 attempts")
+# ═══════════════════════════════════════════════════════════════════════════════
+# DATA LAYER
+# ═══════════════════════════════════════════════════════════════════════════════
 
-
-def daily_returns(prices: pd.Series) -> pd.Series:
-    return prices.pct_change().dropna()
-
-
-# ── Module 1: Fama-French 4-Factor regression ─────────────────────────────────
-def ff4_factor_tilt(ticker: str) -> dict:
-    """
-    Single-factor CAPM regression against SPY (market proxy).
-    Alpha = annualized excess return above market-implied return.
-    Kept to one download to stay fast on free-tier hosting.
-    """
-    stock_px = fetch_prices(ticker, "1y")
-    spy_px   = fetch_prices("SPY",   "1y")
-
-    stock_r = daily_returns(stock_px)
-    mkt_r   = daily_returns(spy_px)
-
-    df = pd.DataFrame({"stock": stock_r, "mkt": mkt_r}).dropna()
-
-    if len(df) < 60:
-        return {"beta_mkt": 1.0, "beta_smb": 0.0, "beta_hml": 0.0, "beta_mom": 0.0, "alpha_ann": 0.0}
-
-    X = df[["mkt"]].values
-    y = df["stock"].values
-    X_aug = np.column_stack([np.ones(len(X)), X])
-    try:
-        coeffs, _, _, _ = np.linalg.lstsq(X_aug, y, rcond=None)
-    except Exception:
-        coeffs = [0.0, 1.0]
-
-    alpha_ann = float(coeffs[0]) * 252
-    beta_mkt  = float(coeffs[1])
-
-    return {
-        "beta_mkt":  round(beta_mkt, 3),
-        "beta_smb":  0.0,
-        "beta_hml":  0.0,
-        "beta_mom":  0.0,
-        "alpha_ann": round(alpha_ann, 4),
-    }
-
-
-# ── Module 2: Historical base rate ────────────────────────────────────────────
-def historical_base_rate(ticker: str, direction: str, horizon_days: int) -> dict:
-    """
-    What fraction of rolling horizon-day windows returned a profit for long/short?
-    Uses 5 years of daily data.
-    """
-    prices = fetch_prices(ticker, "2y")
-    if len(prices) < horizon_days + 10:
-        return {"base_rate": 0.5, "n_windows": 0}
-
-    wins = 0
-    total = 0
-    price_arr = prices.values
-    for i in range(len(price_arr) - horizon_days):
-        ret = (price_arr[i + horizon_days] - price_arr[i]) / price_arr[i]
-        if direction == "long":
-            wins += int(ret > 0)
-        else:
-            wins += int(ret < 0)
-        total += 1
-
-    rate = wins / total if total > 0 else 0.5
-    return {"base_rate": round(rate, 4), "n_windows": total}
-
-
-# ── Module 3: Volatility (VIX/Beta-derived) ───────────────────────────────────
-def implied_vol_proxy(ticker: str, beta: float) -> dict:
-    """
-    Estimate implied volatility using realized vol + VIX scaling by beta.
-    """
-    prices = fetch_prices(ticker, "1y")
-    returns = daily_returns(prices)
-    realized_vol_ann = float(returns.std() * math.sqrt(252))
-
-    vix_px = fetch_prices("^VIX", "5d")
-    current_vix = float(vix_px.iloc[-1]) / 100.0 if len(vix_px) > 0 else 0.20
-
-    # Implied vol proxy: blend realized + VIX-scaled-by-beta
-    implied = 0.5 * realized_vol_ann + 0.5 * (current_vix * abs(beta))
-    implied = max(0.05, min(implied, 2.0))
-
-    return {
-        "realized_vol_ann": round(realized_vol_ann, 4),
-        "vix_current":      round(current_vix * 100, 2),
-        "implied_vol_proxy": round(implied, 4),
-    }
-
-
-# ── Module 4: Monte Carlo GBM simulation ──────────────────────────────────────
-def monte_carlo(
-    current_price: float,
-    entry_price: float | None,
-    direction: str,
-    horizon_days: int,
-    sigma: float,
-    alpha_ann: float,
-    beta_mkt: float,
-    n_paths: int = 10_000,
-) -> dict:
-    """
-    GBM with factor-implied drift. Returns terminal distribution stats.
-    """
-    if entry_price is None or entry_price <= 0:
-        entry_price = current_price
-
-    # Factor-implied drift: risk-free ~4.5% + alpha from FF4
-    rf_daily   = 0.045 / 252
-    drift_daily = rf_daily + alpha_ann / 252
-    sigma_daily = sigma / math.sqrt(252)
-
-    rng = np.random.default_rng(seed=42)
-    Z   = rng.standard_normal((n_paths, horizon_days))
-    log_returns = (drift_daily - 0.5 * sigma_daily ** 2) + sigma_daily * Z
-    terminal_prices = current_price * np.exp(log_returns.sum(axis=1))
-
-    if direction == "long":
-        profitable = terminal_prices > entry_price
-    else:
-        profitable = terminal_prices < entry_price
-
-    p_mc = float(profitable.mean())
-    terminal_rets = (terminal_prices - entry_price) / entry_price
-    if direction == "short":
-        terminal_rets = -terminal_rets
-
-    return {
-        "p_mc":      round(p_mc, 4),
-        "median_ret": round(float(np.median(terminal_rets)), 4),
-        "p5_ret":    round(float(np.percentile(terminal_rets, 5)), 4),
-        "p95_ret":   round(float(np.percentile(terminal_rets, 95)), 4),
-        "n_paths":   n_paths,
-    }
-
-
-# ── Module 5: Historical analogues ────────────────────────────────────────────
-def historical_analogues(ticker: str, direction: str, horizon_days: int, current_vol: float) -> dict:
-    """
-    Find past 90-day windows where trailing vol was similar to today.
-    Return average forward return in those regimes.
-    """
-    prices = fetch_prices(ticker, "2y")
-    if len(prices) < 90 + horizon_days:
-        return {"analogue_p": 0.5, "n_analogues": 0, "avg_fwd_ret": 0.0}
-
-    rets   = daily_returns(prices)
-    price_arr = prices.values
-    ret_arr   = rets.values
-
-    # Rolling 30-day realized vol
-    roll_vol = pd.Series(ret_arr).rolling(30).std().values * math.sqrt(252)
-
-    analogues = []
-    for i in range(30, len(price_arr) - horizon_days):
-        hist_vol = roll_vol[i]
-        if np.isnan(hist_vol):
-            continue
-        # vol regime match: within 30% of current vol
-        if abs(hist_vol - current_vol) / (current_vol + 1e-9) < 0.30:
-            fwd_ret = (price_arr[i + horizon_days] - price_arr[i]) / price_arr[i]
-            if direction == "short":
-                fwd_ret = -fwd_ret
-            analogues.append(fwd_ret)
-
-    if not analogues:
-        return {"analogue_p": 0.5, "n_analogues": 0, "avg_fwd_ret": 0.0}
-
-    analogue_p = float(np.mean([r > 0 for r in analogues]))
-    avg_fwd    = float(np.mean(analogues))
-
-    return {
-        "analogue_p":  round(analogue_p, 4),
-        "n_analogues": len(analogues),
-        "avg_fwd_ret": round(avg_fwd, 4),
-    }
-
-
-# ── Module 6: Ensemble blend ──────────────────────────────────────────────────
-def ensemble_blend(
-    base_rate: float,
-    p_mc:      float,
-    analogue_p: float,
-    vol_regime: str,
-) -> dict:
-    """
-    Weighted average of probability estimates.
-    Weights reflect model reliability: MC > base rate > analogues.
-    Vol regime adjusts confidence band.
-    """
-    weights = {"base_rate": 0.25, "mc": 0.50, "analogue": 0.25}
-    if vol_regime == "high":
-        weights = {"base_rate": 0.20, "mc": 0.55, "analogue": 0.25}
-
-    blended = (
-        weights["base_rate"] * base_rate
-        + weights["mc"]       * p_mc
-        + weights["analogue"] * analogue_p
-    )
-    blended = max(0.05, min(0.95, blended))
-
-    return {"p_ensemble": round(blended, 4), "weights": weights}
-
-
-# ── Fundamentals from yfinance info ───────────────────────────────────────────
-def get_fundamentals(ticker: str) -> dict:
-    cached_val = cached(f"info_{ticker}")
-    if cached_val is not None:
-        return cached_val
-
-    try:
-        info = yf.Ticker(ticker, session=_session).info
-    except Exception:
-        info = {}
-
-    def safe(key, default=None):
-        v = info.get(key)
-        return v if v is not None else default
-
-    result = {
-        "name":            safe("longName", ticker),
-        "sector":          safe("sector", "Unknown"),
-        "industry":        safe("industry", "Unknown"),
-        "market_cap":      safe("marketCap"),
-        "pe_forward":      safe("forwardPE"),
-        "pe_trailing":     safe("trailingPE"),
-        "ev_ebitda":       safe("enterpriseToEbitda"),
-        "revenue_growth":  safe("revenueGrowth"),
-        "gross_margins":   safe("grossMargins"),
-        "profit_margins":  safe("profitMargins"),
-        "debt_to_equity":  safe("debtToEquity"),
-        "return_on_equity": safe("returnOnEquity"),
-        "return_on_assets": safe("returnOnAssets"),
-        "free_cashflow":   safe("freeCashflow"),
-        "beta":            safe("beta", 1.0),
-        "52w_high":        safe("fiftyTwoWeekHigh"),
-        "52w_low":         safe("fiftyTwoWeekLow"),
-        "avg_volume":      safe("averageVolume"),
-        "short_ratio":     safe("shortRatio"),
-        "analyst_target":  safe("targetMeanPrice"),
-        "recommendation":  safe("recommendationKey", "hold"),
-        "num_analysts":    safe("numberOfAnalystOpinions", 0),
-    }
-    return store(f"info_{ticker}", result)
-
-
-# ── Price momentum features ───────────────────────────────────────────────────
 def get_live_price(ticker: str) -> float:
-    """
-    Fetch real-time price from Twelve Data (primary) with yfinance fast_info fallback.
-    Twelve Data free tier: 800 calls/day, always returns today's price.
-    """
-    # Primary: Twelve Data
+    """Real-time price: Twelve Data primary, yfinance fallback."""
     if TWELVEDATA_KEY:
         try:
             r = _session.get(
@@ -351,251 +64,676 @@ def get_live_price(ticker: str) -> float:
                 params={"symbol": ticker, "apikey": TWELVEDATA_KEY},
                 timeout=8,
             )
-            data = r.json()
-            price = float(data.get("price", 0))
+            price = float(r.json().get("price", 0))
             if price > 0:
                 return price
         except Exception:
             pass
-
-    # Fallback: yfinance fast_info
     try:
-        fi = yf.Ticker(ticker, session=_session).fast_info
-        price = float(fi.last_price)
-        if price > 0:
-            return price
+        return float(yf.Ticker(ticker, session=_session).fast_info.last_price)
+    except Exception:
+        return 0.0
+
+
+def get_ohlcv(ticker: str) -> pd.DataFrame:
+    """
+    2yr daily OHLCV. Twelve Data primary (one API call), yfinance fallback.
+    Returns DataFrame [date, open, high, low, close, volume] oldest-first.
+    """
+    key = f"ohlcv_{ticker}"
+    hit = cached(key, 600)
+    if hit is not None:
+        return hit
+
+    if TWELVEDATA_KEY:
+        try:
+            r = _session.get(
+                "https://api.twelvedata.com/time_series",
+                params={"symbol": ticker, "interval": "1day",
+                        "outputsize": 504, "apikey": TWELVEDATA_KEY},
+                timeout=15,
+            )
+            data = r.json()
+            if "values" in data and data["values"]:
+                df = pd.DataFrame(data["values"])
+                df["date"] = pd.to_datetime(df["datetime"])
+                for c in ["open", "high", "low", "close", "volume"]:
+                    df[c] = pd.to_numeric(df[c], errors="coerce")
+                df = df[["date","open","high","low","close","volume"]].sort_values("date").reset_index(drop=True).dropna(subset=["close"])
+                if len(df) > 50:
+                    return store(key, df)
+        except Exception:
+            pass
+
+    try:
+        raw = yf.download(ticker, period="2y", progress=False, auto_adjust=True, session=_session)
+        if not raw.empty:
+            df = raw.reset_index()
+            df.columns = ["date","open","high","low","close","volume"] if len(df.columns) == 6 else df.columns
+            df = df.rename(columns={df.columns[0]: "date"})
+            cols = {c: c.lower() for c in df.columns}
+            df = df.rename(columns=cols)
+            df = df[["date","open","high","low","close","volume"]].dropna(subset=["close"])
+            return store(key, df)
     except Exception:
         pass
 
-    return 0.0
+    raise HTTPException(502, f"Could not fetch price history for {ticker}")
 
 
-def price_features(ticker: str) -> dict:
-    cur = get_live_price(ticker)
-    if cur <= 0:
-        return {"current_price": 0, "mom_1m": 0, "mom_3m": 0, "mom_6m": 0, "mom_12m": 0}
+def get_fundamentals(ticker: str) -> dict:
+    key = f"fund_{ticker}"
+    hit = cached(key, 3600)
+    if hit is not None:
+        return hit
+    try:
+        info = yf.Ticker(ticker, session=_session).info
+    except Exception:
+        info = {}
 
-    # Historical prices for momentum only — current price always comes from get_live_price
-    prices = fetch_prices(ticker, "1y")
-    if len(prices) < 30:
-        return {"current_price": round(cur, 2), "mom_1m": 0, "mom_3m": 0, "mom_6m": 0, "mom_12m": 0}
+    def safe(k, d=None):
+        v = info.get(k)
+        return v if v is not None else d
 
-    px = prices.values
-
-    def safe_mom(n):
-        idx = max(0, len(px) - n)
-        base = float(px[idx])
-        return round((cur - base) / base, 4) if base > 0 else 0.0
-
-    return {
-        "current_price": round(cur, 2),
-        "mom_1m":  safe_mom(21),
-        "mom_3m":  safe_mom(63),
-        "mom_6m":  safe_mom(126),
-        "mom_12m": safe_mom(252),
+    result = {
+        "name":              safe("longName", ticker),
+        "sector":            safe("sector", "Unknown"),
+        "industry":          safe("industry", "Unknown"),
+        "market_cap":        safe("marketCap"),
+        "beta":              safe("beta", 1.0),
+        "pe_forward":        safe("forwardPE"),
+        "pe_trailing":       safe("trailingPE"),
+        "pb_ratio":          safe("priceToBook"),
+        "ev_ebitda":         safe("enterpriseToEbitda"),
+        "revenue_growth":    safe("revenueGrowth", 0.0),
+        "earnings_growth":   safe("earningsGrowth", 0.0),
+        "gross_margins":     safe("grossMargins", 0.0),
+        "profit_margins":    safe("profitMargins", 0.0),
+        "operating_margins": safe("operatingMargins", 0.0),
+        "roe":               safe("returnOnEquity", 0.0),
+        "roa":               safe("returnOnAssets", 0.0),
+        "debt_to_equity":    safe("debtToEquity"),
+        "current_ratio":     safe("currentRatio"),
+        "free_cashflow":     safe("freeCashflow"),
+        "revenue":           safe("totalRevenue"),
+        "total_assets":      safe("totalAssets"),
+        "employees":         safe("fullTimeEmployees"),
+        "short_ratio":       safe("shortRatio", 0.0),
+        "short_pct_float":   safe("shortPercentOfFloat", 0.0),
+        "analyst_target":    safe("targetMeanPrice"),
+        "recommendation":    safe("recommendationKey", "hold"),
+        "num_analysts":      safe("numberOfAnalystOpinions", 0),
+        "52w_high":          safe("fiftyTwoWeekHigh"),
+        "52w_low":           safe("fiftyTwoWeekLow"),
+        "avg_volume":        safe("averageVolume"),
+        "insider_pct":       safe("heldPercentInsiders", 0.0),
+        "institution_pct":   safe("heldPercentInstitutions", 0.0),
+        "rd_to_revenue":     0.0,
+        "intangibles_ratio": 0.0,
     }
 
+    # R&D ratio from income statement
+    try:
+        tk = yf.Ticker(ticker, session=_session)
+        fs = tk.get_financials()
+        if fs is not None and not fs.empty:
+            rd_row = "Research And Development"
+            rev_row = "Total Revenue"
+            if rd_row in fs.index and rev_row in fs.index:
+                rd  = float(fs.loc[rd_row].iloc[0] or 0)
+                rev = float(fs.loc[rev_row].iloc[0] or 1)
+                result["rd_to_revenue"] = rd / rev if rev else 0
+    except Exception:
+        pass
 
-# ── Factor radar (0–10 scores) ────────────────────────────────────────────────
-def factor_radar(fund: dict, ff4: dict, px: dict) -> dict:
-    """Normalize each factor into a 0-10 score for the radar chart."""
+    # Intangibles ratio from balance sheet
+    try:
+        tk = yf.Ticker(ticker, session=_session)
+        bs = tk.get_balance_sheet()
+        if bs is not None and not bs.empty:
+            intang_row = "Goodwill And Other Intangible Assets"
+            asset_row  = "Total Assets"
+            if intang_row in bs.index and asset_row in bs.index:
+                intang = float(bs.loc[intang_row].iloc[0] or 0)
+                assets = float(bs.loc[asset_row].iloc[0] or 1)
+                result["intangibles_ratio"] = intang / assets if assets else 0
+    except Exception:
+        pass
 
-    def clamp(x): return max(0.0, min(10.0, x))
-
-    # Value: lower P/E = better value (score 10 if PE < 10, 0 if PE > 50)
-    pe = fund.get("pe_forward") or fund.get("pe_trailing") or 25.0
-    value = clamp(10 - (pe - 10) * 10 / 40) if pe else 5.0
-
-    # Growth: revenue growth (score 10 if >50%, 0 if negative)
-    rg = (fund.get("revenue_growth") or 0.0) * 100
-    growth = clamp(5 + rg / 10)
-
-    # Quality: margins + ROE
-    pm = (fund.get("profit_margins") or 0.0) * 100
-    roe = (fund.get("return_on_equity") or 0.0) * 100
-    quality = clamp((pm / 4) + (roe / 20) * 5)
-
-    # Momentum: 12m price momentum
-    mom12 = px.get("mom_12m", 0.0) * 100
-    momentum = clamp(5 + mom12 / 20)
-
-    # Sentiment: FF4 alpha + analyst recommendation
-    rec_map = {"strongBuy": 3, "buy": 2, "hold": 0, "underperform": -1, "sell": -2}
-    rec_score = rec_map.get(fund.get("recommendation", "hold"), 0)
-    alpha_score = clamp(5 + ff4["alpha_ann"] * 100 + rec_score)
-    sentiment = clamp(alpha_score)
-
-    return {
-        "value":    round(value, 1),
-        "growth":   round(growth, 1),
-        "quality":  round(quality, 1),
-        "momentum": round(momentum, 1),
-        "sentiment": round(sentiment, 1),
-    }
+    return store(key, result)
 
 
-# ── Main forecast endpoint ─────────────────────────────────────────────────────
-@app.get("/v1/forecast")
-async def forecast(
-    ticker:  str   = Query(..., description="Stock ticker e.g. AAPL"),
-    horizon: int   = Query(90,  description="Days forward"),
-    dir:     str   = Query("long", description="long or short"),
-    entry:   float = Query(None, description="Entry price (optional, defaults to current)"),
-):
-    ticker  = ticker.upper().strip()
-    horizon = max(1, min(horizon, 365))
-    direction = dir.lower()
-    if direction not in ("long", "short"):
-        raise HTTPException(400, "dir must be 'long' or 'short'")
+def get_macro() -> dict:
+    """VIX, SPY 200MA trend, yield curve — classifies market regime."""
+    hit = cached("macro", 900)
+    if hit is not None:
+        return hit
+
+    result = {"vix": 20.0, "spy_above_200ma": True, "yield_curve": 0.5,
+              "yield_10yr": 4.5, "yield_2yr": 4.0, "regime": "neutral"}
 
     try:
-        fund  = get_fundamentals(ticker)
-        px    = price_features(ticker)
-    except Exception as e:
-        raise HTTPException(502, f"Data fetch failed for {ticker}: {str(e)}")
+        vix = yf.download("^VIX", period="5d", progress=False, session=_session)
+        if not vix.empty:
+            result["vix"] = float(vix["Close"].iloc[-1])
+    except Exception:
+        pass
 
-    current_price = px["current_price"]
-    if current_price <= 0:
-        raise HTTPException(404, f"No price data found for {ticker}")
+    try:
+        spy = yf.download("SPY", period="1y", progress=False, auto_adjust=True, session=_session)
+        if not spy.empty and len(spy) >= 200:
+            arr = spy["Close"].values
+            ma200 = float(np.mean(arr[-200:]))
+            result["spy_above_200ma"] = float(arr[-1]) > ma200
+            result["spy_price"] = float(arr[-1])
+            result["spy_ma200"] = round(ma200, 2)
+    except Exception:
+        pass
 
-    entry_price = entry if (entry and entry > 0) else current_price
-    beta = fund.get("beta") or 1.0
+    try:
+        tnx = yf.download("^TNX", period="5d", progress=False, session=_session)
+        irx = yf.download("^IRX", period="5d", progress=False, session=_session)
+        if not tnx.empty and not irx.empty:
+            yr10 = float(tnx["Close"].iloc[-1])
+            yr2  = float(irx["Close"].iloc[-1])
+            result["yield_10yr"]   = round(yr10, 2)
+            result["yield_2yr"]    = round(yr2, 2)
+            result["yield_curve"]  = round(yr10 - yr2, 2)
+    except Exception:
+        pass
 
-    # Run all modules
-    ff4   = ff4_factor_tilt(ticker)
-    br    = historical_base_rate(ticker, direction, horizon)
-    vol   = implied_vol_proxy(ticker, beta)
-    mc    = monte_carlo(current_price, entry_price, direction, horizon,
-                        sigma=vol["implied_vol_proxy"],
-                        alpha_ann=ff4["alpha_ann"],
-                        beta_mkt=ff4["beta_mkt"])
-    ana   = historical_analogues(ticker, direction, horizon, vol["realized_vol_ann"])
+    vix  = result["vix"]
+    bull = result["spy_above_200ma"]
 
-    vol_regime = "high" if vol["implied_vol_proxy"] > 0.35 else "normal"
-    ens   = ensemble_blend(br["base_rate"], mc["p_mc"], ana["analogue_p"], vol_regime)
-    radar = factor_radar(fund, ff4, px)
+    if bull and vix < 18:     regime = "bull_low_vol"
+    elif bull and vix < 28:   regime = "bull_normal"
+    elif bull:                regime = "bull_high_vol"
+    elif vix < 28:            regime = "bear_normal"
+    else:                     regime = "bear_high_vol"
 
-    p_win = ens["p_ensemble"]
-    implied_move_pct = round(vol["implied_vol_proxy"] * math.sqrt(horizon / 252) * 100, 1)
+    result["regime"] = regime
+    return store("macro", result)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FACTOR MODULES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def module_technical(df: pd.DataFrame, cur: float) -> dict:
+    """Module 1 — Technical & price dynamics."""
+    closes  = df["close"].values.astype(float)
+    volumes = df["volume"].values.astype(float)
+    n = len(closes)
+
+    def mom(days):
+        idx  = max(0, n - days)
+        base = float(closes[idx])
+        return round((cur - base) / base, 4) if base > 0 else 0.0
+
+    # RSI(14)
+    d   = np.diff(closes[-30:] if n >= 30 else closes)
+    g   = np.where(d > 0, d, 0.0)
+    l   = np.where(d < 0, -d, 0.0)
+    ag  = np.mean(g[-14:]) if len(g) >= 14 else 0
+    al  = np.mean(l[-14:]) if len(l) >= 14 else 1e-9
+    rsi = 100 - (100 / (1 + ag / (al + 1e-9)))
+
+    ma50  = float(np.mean(closes[-50:]))  if n >= 50  else cur
+    ma200 = float(np.mean(closes[-200:])) if n >= 200 else cur
+
+    w52    = closes[-252:] if n >= 252 else closes
+    high52 = float(np.max(w52))
+    low52  = float(np.min(w52))
+    pct_from_high = (cur - high52) / high52
+
+    vol20 = float(np.mean(volumes[-20:])) if n >= 20 else 1
+    vol60 = float(np.mean(volumes[-60:])) if n >= 60 else 1
+    vol_ratio = vol20 / (vol60 + 1e-9)
+
+    # Composite score (-1 to +1)
+    score = (
+        0.25 * float(np.clip((rsi - 50) / 30, -1, 1)) +
+        0.20 * (1.0 if cur > ma50  else -1.0) +
+        0.20 * (1.0 if cur > ma200 else -1.0) +
+        0.20 * float(np.clip(mom(63) * 4, -1, 1)) +
+        0.15 * float(np.clip((vol_ratio - 1) * 2, -1, 1))
+    )
 
     return {
-        "ticker":        ticker,
-        "name":          fund["name"],
-        "sector":        fund["sector"],
-        "direction":     direction,
-        "horizon_days":  horizon,
-        "current_price": current_price,
-        "entry_price":   round(entry_price, 2),
-
-        # ── Headline probability ──────────────────────────────────────────
-        "p_win":         p_win,
-        "verdict":       verdict(p_win),
-
-        # ── Module outputs ────────────────────────────────────────────────
-        "modules": {
-            "ff4_factors":    ff4,
-            "base_rate":      br,
-            "implied_vol":    vol,
-            "monte_carlo":    mc,
-            "analogues":      ana,
-            "ensemble":       ens,
-        },
-
-        # ── Factor radar (0–10) ───────────────────────────────────────────
-        "factor_radar": radar,
-
-        # ── Price features ────────────────────────────────────────────────
-        "price_momentum": px,
-
-        # ── Fundamentals snapshot ─────────────────────────────────────────
-        "fundamentals": {
-            "pe_forward":     fund.get("pe_forward"),
-            "revenue_growth": fund.get("revenue_growth"),
-            "profit_margins": fund.get("profit_margins"),
-            "return_on_equity": fund.get("return_on_equity"),
-            "debt_to_equity": fund.get("debt_to_equity"),
-            "beta":           beta,
-            "market_cap":     fund.get("market_cap"),
-            "analyst_target": fund.get("analyst_target"),
-            "recommendation": fund.get("recommendation"),
-            "num_analysts":   fund.get("num_analysts"),
-            "short_ratio":    fund.get("short_ratio"),
-        },
-
-        # ── Implied move ──────────────────────────────────────────────────
-        "implied_move_pct": implied_move_pct,
-
-        "generated_at": datetime.utcnow().isoformat() + "Z",
-        "data_source":  "yfinance / Yahoo Finance (free tier)",
-        "model_version": "TradeOdds-v1.0 (FF4+MOM+MC+Analogues)",
+        "score":            round(float(score), 4),
+        "rsi":              round(float(rsi), 1),
+        "above_50ma":       bool(cur > ma50),
+        "above_200ma":      bool(cur > ma200),
+        "ma50":             round(float(ma50), 2),
+        "ma200":            round(float(ma200), 2),
+        "mom_1m":           mom(21),
+        "mom_3m":           mom(63),
+        "mom_6m":           mom(126),
+        "mom_12m":          mom(252),
+        "pct_from_52w_high": round(float(pct_from_high), 4),
+        "high_52w":         round(float(high52), 2),
+        "low_52w":          round(float(low52), 2),
+        "vol_ratio":        round(float(vol_ratio), 3),
     }
 
 
-# ── Screener endpoint ──────────────────────────────────────────────────────────
-SP500_SAMPLE = [
-    "AAPL","MSFT","NVDA","AMZN","GOOGL","META","BRK-B","LLY","AVGO","JPM",
-    "TSLA","UNH","V","XOM","MA","JNJ","PG","HD","COST","MRK",
-]
+def module_market_factor(df: pd.DataFrame, beta: float) -> dict:
+    """Module 2 — CAPM regression: isolate alpha from market beta."""
+    try:
+        spy_df = get_ohlcv("SPY")
+    except Exception:
+        return {"alpha_ann": 0.0, "beta": beta, "score": 0.0, "r_squared": 0.0}
 
-@app.get("/v1/screener/top")
-async def screener(limit: int = Query(10), dir: str = Query("long")):
+    merged = pd.merge(
+        df[["date","close"]].rename(columns={"close":"stock"}),
+        spy_df[["date","close"]].rename(columns={"close":"spy"}),
+        on="date"
+    ).dropna()
+
+    if len(merged) < 60:
+        return {"alpha_ann": 0.0, "beta": beta, "score": 0.0, "r_squared": 0.0}
+
+    sr = merged["stock"].pct_change().dropna().values
+    mr = merged["spy"].pct_change().dropna().values
+    n  = min(len(sr), len(mr))
+    sr, mr = sr[-n:], mr[-n:]
+
+    X = np.column_stack([np.ones(n), mr])
+    try:
+        coeffs, _, _, _ = np.linalg.lstsq(X, sr, rcond=None)
+        alpha_d = float(coeffs[0])
+        beta_r  = float(coeffs[1])
+        pred    = X @ coeffs
+        ss_res  = float(np.sum((sr - pred) ** 2))
+        ss_tot  = float(np.sum((sr - sr.mean()) ** 2))
+        r2      = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
+    except Exception:
+        alpha_d, beta_r, r2 = 0.0, beta, 0.0
+
+    alpha_ann = alpha_d * 252
+    score     = float(np.clip(alpha_ann / 0.20, -1, 1))
+
+    return {
+        "alpha_ann":  round(alpha_ann, 4),
+        "beta":       round(beta_r, 3),
+        "score":      round(score, 4),
+        "r_squared":  round(r2, 3),
+    }
+
+
+def module_fundamentals(fund: dict, cur: float) -> dict:
+    """Module 3 — Fundamental quality: profitability, growth, value, safety."""
+    gm   = (fund.get("gross_margins")  or 0) * 100
+    pm   = (fund.get("profit_margins") or 0) * 100
+    roe  = (fund.get("roe")            or 0) * 100
+    roa  = (fund.get("roa")            or 0) * 100
+    rg   = (fund.get("revenue_growth") or 0) * 100
+    eg   = (fund.get("earnings_growth")or 0) * 100
+    pe   = fund.get("pe_forward") or fund.get("pe_trailing") or 25.0
+    pb   = fund.get("pb_ratio")  or 3.0
+    ev_e = fund.get("ev_ebitda") or 15.0
+    de   = fund.get("debt_to_equity") or 50.0
+    cr   = fund.get("current_ratio")  or 1.5
+
+    profitability = float(np.clip(gm / 8 + pm / 4 + roe / 15, 0, 10))
+    growth        = float(np.clip(5 + rg / 10 + eg / 20, 0, 10))
+    value         = float(np.clip(10 - (pe - 10) * 10/50 - (pb - 1) * 0.5 - (ev_e - 8) * 0.2, 0, 10))
+    safety        = float(np.clip(5 - de / 100 + (cr - 1) * 2, 0, 10))
+
+    rec_map = {"strongbuy": 2, "buy": 1, "hold": 0, "underperform": -1, "sell": -2}
+    rec     = rec_map.get((fund.get("recommendation") or "hold").lower(), 0)
+    target  = fund.get("analyst_target")
+    upside  = ((target - cur) / cur) if (target and cur > 0) else 0.0
+
+    composite = float(
+        0.25 * np.clip((profitability - 5) / 5, -1, 1) +
+        0.25 * np.clip((growth - 5) / 5, -1, 1) +
+        0.20 * np.clip((value - 5) / 5, -1, 1) +
+        0.15 * np.clip((safety - 5) / 5, -1, 1) +
+        0.15 * np.clip(upside * 2 + rec * 0.1, -1, 1)
+    )
+
+    return {
+        "score":             round(composite, 4),
+        "profitability":     round(profitability, 1),
+        "growth":            round(growth, 1),
+        "value":             round(value, 1),
+        "safety":            round(safety, 1),
+        "gross_margin_pct":  round(gm, 1),
+        "profit_margin_pct": round(pm, 1),
+        "roe_pct":           round(roe, 1),
+        "roa_pct":           round(roa, 1),
+        "rev_growth_pct":    round(rg, 1),
+        "eps_growth_pct":    round(eg, 1),
+        "pe_forward":        round(float(pe), 1),
+        "pb_ratio":          round(float(pb), 2),
+        "debt_to_equity":    round(float(de), 1),
+        "upside_to_target":  round(float(upside * 100), 1),
+        "analyst_rec":       fund.get("recommendation", "hold"),
+        "num_analysts":      fund.get("num_analysts", 0),
+    }
+
+
+def module_modern_factors(fund: dict) -> dict:
+    """
+    Module 4 — Modern company factors.
+    Captures what traditional factor models miss:
+    - R&D intensity: investment in future growth optionality
+    - Intangibles ratio: asset-light, platform-type business
+    - Platform economics: high gross margins = pricing power + low marginal cost
+    - Productivity: revenue per employee (network/scale efficiency)
+    """
+    rd    = fund.get("rd_to_revenue") or 0.0
+    intg  = fund.get("intangibles_ratio") or 0.0
+    gm    = (fund.get("gross_margins") or 0) * 100
+    rev   = fund.get("revenue") or 0
+    emp   = fund.get("employees") or 1
+    rev_per_emp = rev / emp if emp > 0 else 0
+
+    # R&D intensity: 5-25% = innovation sweet spot
+    if rd > 0.40:   rd_s = 0.5
+    elif rd > 0.05: rd_s = min(1.0, rd / 0.15)
+    else:           rd_s = rd / 0.05 * 0.3
+
+    platform_s  = float(np.clip(intg * 0.5 + gm / 100 * 0.5, 0, 1))
+    prod_s      = float(np.clip(rev_per_emp / 500_000, 0, 1))
+    moat_s      = float(np.clip(gm / 60, 0, 1))
+
+    composite = float(
+        0.30 * (rd_s * 2 - 1) +
+        0.30 * (platform_s * 2 - 1) +
+        0.20 * (prod_s * 2 - 1) +
+        0.20 * (moat_s * 2 - 1)
+    )
+
+    return {
+        "score":                round(composite, 4),
+        "rd_intensity_pct":     round(rd * 100, 1),
+        "intangibles_pct":      round(intg * 100, 1),
+        "platform_score":       round(platform_s, 3),
+        "productivity_score":   round(prod_s, 3),
+        "moat_score":           round(moat_s, 3),
+        "rev_per_employee_k":   round(rev_per_emp / 1000, 1),
+        "gross_margin_pct":     round(gm, 1),
+    }
+
+
+def module_sentiment(fund: dict, cur: float) -> dict:
+    """
+    Module 5 — Sentiment & positioning.
+    Short interest, analyst consensus, insider/institutional ownership.
+    """
+    short_pct  = (fund.get("short_pct_float") or 0) * 100
+    short_days = fund.get("short_ratio") or 0
+
+    # Contrarian short squeeze signal at extremes
+    if short_pct > 20:    short_sig = 0.3
+    elif short_pct > 10:  short_sig = -0.2
+    elif short_pct < 3:   short_sig = 0.15
+    else:                 short_sig = 0.0
+
+    rec_map = {"strongbuy": 1.0, "buy": 0.5, "hold": 0.0, "underperform": -0.5, "sell": -1.0}
+    analyst_sig = rec_map.get((fund.get("recommendation") or "hold").lower(), 0)
+
+    target      = fund.get("analyst_target")
+    upside_sig  = float(np.clip(((target - cur) / cur * 2) if (target and cur > 0) else 0, -1, 1))
+
+    inst_pct    = (fund.get("institution_pct") or 0) * 100
+    inst_sig    = 0.2 if 40 < inst_pct < 85 else -0.1
+
+    insider_pct = (fund.get("insider_pct") or 0) * 100
+    insider_sig = float(np.clip(insider_pct / 20, 0, 0.5))
+
+    composite = float(
+        0.25 * short_sig +
+        0.30 * analyst_sig +
+        0.25 * upside_sig +
+        0.10 * inst_sig +
+        0.10 * insider_sig
+    )
+
+    return {
+        "score":                round(composite, 4),
+        "short_pct_float":      round(short_pct, 1),
+        "short_ratio_days":     round(float(short_days), 1),
+        "analyst_rec":          fund.get("recommendation", "hold"),
+        "analyst_upside_pct":   round(float(upside_sig * 50), 1),
+        "institutional_pct":    round(float(inst_pct), 1),
+        "insider_pct":          round(float(insider_pct), 1),
+        "num_analysts":         fund.get("num_analysts", 0),
+    }
+
+
+def module_vol_surface(df: pd.DataFrame, beta: float, vix: float) -> dict:
+    """Module 7 — Volatility surface: realized vol, vol-of-vol, implied proxy."""
+    closes  = df["close"].values.astype(float)
+    returns = np.diff(np.log(closes + 1e-9))
+
+    v20  = float(np.std(returns[-20:])  * math.sqrt(252)) if len(returns) >= 20  else 0.25
+    v60  = float(np.std(returns[-60:])  * math.sqrt(252)) if len(returns) >= 60  else 0.25
+    v252 = float(np.std(returns[-252:]) * math.sqrt(252)) if len(returns) >= 252 else 0.25
+
+    # Vol-of-vol: variance of rolling 20d vol
+    if len(returns) >= 40:
+        rvol = pd.Series(returns).rolling(20).std().dropna().values * math.sqrt(252)
+        vov  = float(np.std(rvol)) if len(rvol) > 5 else 0.05
+    else:
+        vov = 0.05
+
+    # VIX-scaled implied vol proxy (blends realized + macro fear)
+    implied = float(np.clip(
+        0.40 * v60 + 0.40 * (vix / 100 * abs(beta)) + 0.20 * v252,
+        0.08, 2.5
+    ))
+
+    vol_regime = "low" if implied < 0.20 else ("high" if implied > 0.35 else "normal")
+
+    return {
+        "realized_vol_20d": round(v20, 4),
+        "realized_vol_60d": round(v60, 4),
+        "realized_vol_1yr": round(v252, 4),
+        "implied_vol":      round(implied, 4),
+        "vol_of_vol":       round(vov, 4),
+        "vol_regime":       vol_regime,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PROBABILITY ENGINE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Regime-conditional factor weights — the market environment determines
+# which signals deserve more trust
+REGIME_WEIGHTS = {
+    "bull_low_vol":  {"technical":0.20,"market":0.15,"fundamental":0.18,"modern":0.12,"sentiment":0.15,"base_rate":0.10,"analogues":0.10},
+    "bull_normal":   {"technical":0.17,"market":0.15,"fundamental":0.20,"modern":0.10,"sentiment":0.15,"base_rate":0.13,"analogues":0.10},
+    "bull_high_vol": {"technical":0.10,"market":0.15,"fundamental":0.25,"modern":0.08,"sentiment":0.10,"base_rate":0.18,"analogues":0.14},
+    "bear_normal":   {"technical":0.12,"market":0.18,"fundamental":0.25,"modern":0.08,"sentiment":0.10,"base_rate":0.15,"analogues":0.12},
+    "bear_high_vol": {"technical":0.08,"market":0.18,"fundamental":0.28,"modern":0.06,"sentiment":0.08,"base_rate":0.18,"analogues":0.14},
+    "neutral":       {"technical":0.15,"market":0.15,"fundamental":0.22,"modern":0.10,"sentiment":0.13,"base_rate":0.13,"analogues":0.12},
+}
+
+
+def _sample_t(df_deg: float, rows: int, cols: int, rng: np.random.Generator) -> np.ndarray:
+    """Student's t samples via normal / sqrt(chi2/df) — no scipy needed."""
+    z = rng.standard_normal((rows, cols))
+    v = rng.chisquare(df_deg, (rows, cols))
+    return z / np.sqrt(v / df_deg)
+
+
+def run_monte_carlo(
+    cur: float, entry: float, direction: str,
+    horizon: int, sigma: float, alpha_ann: float,
+    n_paths: int = 10_000, t_df: float = 5.0,
+) -> dict:
+    """
+    Fat-tailed Monte Carlo (Student's t, df=5).
+    t(5) has ~3x the kurtosis of normal — captures earnings gaps and tail events
+    that lognormal GBM systematically underprices.
+    """
+    rf_d    = 0.045 / 252
+    drift_d = rf_d + alpha_ann / 252
+    sig_d   = sigma / math.sqrt(252)
+    # Scale shocks so variance matches GBM (t(df) has var=df/(df-2))
+    t_scale = math.sqrt((t_df - 2) / t_df) if t_df > 2 else 1.0
+
+    rng    = np.random.default_rng(seed=42)
+    shocks = _sample_t(t_df, n_paths, horizon, rng) * sig_d / t_scale
+    log_r  = (drift_d - 0.5 * sig_d ** 2) + shocks
+    terminal = cur * np.exp(log_r.sum(axis=1))
+
+    if direction == "long":
+        wins    = terminal > entry
+        rets    = (terminal - entry) / entry
+    else:
+        wins    = terminal < entry
+        rets    = (entry - terminal) / entry
+
+    p_mc     = float(wins.mean())
+    avg_win  = float(rets[wins].mean())  if wins.sum() > 0  else 0.0
+    avg_loss = float(rets[~wins].mean()) if (~wins).sum() > 0 else 0.0
+    ev_pct   = p_mc * avg_win + (1 - p_mc) * avg_loss
+
+    return {
+        "p_mc":        round(p_mc, 4),
+        "median_ret":  round(float(np.median(rets)), 4),
+        "p5_ret":      round(float(np.percentile(rets, 5)), 4),
+        "p95_ret":     round(float(np.percentile(rets, 95)), 4),
+        "avg_win":     round(avg_win, 4),
+        "avg_loss":    round(avg_loss, 4),
+        "ev_pct":      round(ev_pct, 4),
+        "var_95_pct":  round(float(np.percentile(rets, 5)), 4),
+        "n_paths":     n_paths,
+        "model":       "GBM-student-t-df5",
+    }
+
+
+def run_base_rate(df: pd.DataFrame, direction: str, horizon: int) -> dict:
+    closes = df["close"].values.astype(float)
+    if len(closes) < horizon + 20:
+        return {"base_rate": 0.50, "n_windows": 0}
+    wins, total = 0, 0
+    for i in range(len(closes) - horizon):
+        ret = (closes[i + horizon] - closes[i]) / closes[i]
+        wins  += int(ret > 0) if direction == "long" else int(ret < 0)
+        total += 1
+    return {"base_rate": round(wins / total, 4), "n_windows": total}
+
+
+def run_analogues(df: pd.DataFrame, direction: str, horizon: int, cur_vol: float) -> dict:
+    closes  = df["close"].values.astype(float)
+    returns = np.diff(np.log(closes + 1e-9))
+    if len(closes) < 90 + horizon:
+        return {"analogue_p": 0.50, "n_analogues": 0, "avg_fwd_ret": 0.0}
+
     results = []
-    direction = dir.lower()
-    for tk in SP500_SAMPLE[:limit]:
-        try:
-            px   = price_features(tk)
-            fund = get_fundamentals(tk)
-            ff4  = ff4_factor_tilt(tk)
-            vol  = implied_vol_proxy(tk, fund.get("beta") or 1.0)
-            br   = historical_base_rate(tk, direction, 90)
-            mc   = monte_carlo(px["current_price"], px["current_price"], direction, 90,
-                               vol["implied_vol_proxy"], ff4["alpha_ann"], ff4["beta_mkt"])
-            ana  = historical_analogues(tk, direction, 90, vol["realized_vol_ann"])
-            ens  = ensemble_blend(br["base_rate"], mc["p_mc"], ana["analogue_p"],
-                                  "high" if vol["implied_vol_proxy"] > 0.35 else "normal")
-            results.append({
-                "ticker": tk,
-                "name":   fund["name"],
-                "sector": fund["sector"],
-                "p_win":  ens["p_ensemble"],
-                "verdict": verdict(ens["p_ensemble"]),
-                "current_price": px["current_price"],
-                "mom_12m": px["mom_12m"],
-                "alpha_ann": ff4["alpha_ann"],
-            })
-        except Exception:
-            continue
+    for i in range(30, len(closes) - horizon):
+        hv = float(np.std(returns[max(0,i-30):i]) * math.sqrt(252))
+        if abs(hv - cur_vol) / (cur_vol + 1e-9) < 0.30:
+            fwd = (closes[i+horizon] - closes[i]) / closes[i]
+            results.append(fwd if direction == "long" else -fwd)
 
-    results.sort(key=lambda x: x["p_win"], reverse=(direction == "long"))
-    return {"direction": direction, "results": results, "screened_at": datetime.utcnow().isoformat() + "Z"}
+    if not results:
+        return {"analogue_p": 0.50, "n_analogues": 0, "avg_fwd_ret": 0.0}
 
-
-@app.get("/v1/calibration")
-async def calibration():
     return {
-        "model":       "TradeOdds-v1.0",
-        "components":  ["FF4-regression", "historical-base-rate", "GBM-MC-10K", "vol-regime-analogues"],
-        "ensemble_weights": {"base_rate": 0.25, "monte_carlo": 0.50, "analogues": 0.25},
-        "data_source": "yfinance",
-        "note":        "Probabilities are model outputs, not financial advice.",
+        "analogue_p":  round(float(np.mean([r > 0 for r in results])), 4),
+        "n_analogues": len(results),
+        "avg_fwd_ret": round(float(np.mean(results)), 4),
     }
 
 
-@app.api_route("/", methods=["GET", "HEAD"])
-async def root():
-    return {"service": "TradeOdds API", "status": "ok", "docs": "/docs"}
+def run_ensemble(
+    tech, market, fund, modern, sent,
+    mc, base_rate, analogues,
+    weights: dict, direction: str,
+) -> dict:
+    """
+    Blend all 7 factor modules + MC + base rate + analogues into one
+    calibrated probability. Factor scores convert via sigmoid; MC and
+    historical rates are direct probabilities.
+    """
+    d = 1 if direction == "long" else -1
 
+    def s2p(s):  # score (-1,+1) → probability (0.10, 0.90)
+        return float(np.clip(0.50 + float(s) * d * 0.35, 0.10, 0.90))
 
-@app.get("/health")
-async def health():
+    p_tech   = s2p(tech["score"])
+    p_mkt    = s2p(market["score"])
+    p_fund   = s2p(fund["score"])
+    p_mod    = s2p(modern["score"])
+    p_sent   = s2p(sent["score"])
+    p_base   = base_rate if direction == "long" else (1 - base_rate)
+    p_ana    = analogues["analogue_p"]
+    p_mc     = mc["p_mc"]
+
+    factor_blend = (
+        weights["technical"]   * p_tech +
+        weights["market"]      * p_mkt  +
+        weights["fundamental"] * p_fund +
+        weights["modern"]      * p_mod  +
+        weights["sentiment"]   * p_sent +
+        weights["base_rate"]   * p_base +
+        weights["analogues"]   * p_ana
+    )
+
+    # MC carries 40% of final weight — it integrates drift, vol, and fat tails
+    final = float(np.clip(0.40 * p_mc + 0.60 * factor_blend, 0.05, 0.95))
+
+    all_p  = [p_tech, p_mkt, p_fund, p_mod, p_sent, p_base, p_ana, p_mc]
+    spread = float(np.max(all_p) - np.min(all_p))
+    conf   = int(np.clip(88 - spread * 130, 18, 93))
+    bw     = max(4, int(spread * 55))
+
     return {
-        "ok": True,
-        "status": "ok",
-        "provider": "yfinance",
-        "live_data": True,
-        "version": "1.0",
-        "time": datetime.utcnow().isoformat() + "Z",
+        "p_ensemble": round(final, 4),
+        "confidence": conf,
+        "bandwidth":  bw,
+        "module_probs": {
+            "technical":     round(p_tech, 4),
+            "market_alpha":  round(p_mkt, 4),
+            "fundamental":   round(p_fund, 4),
+            "modern":        round(p_mod, 4),
+            "sentiment":     round(p_sent, 4),
+            "base_rate":     round(p_base, 4),
+            "analogues":     round(p_ana, 4),
+            "monte_carlo":   round(p_mc, 4),
+        },
+        "weights": weights,
     }
+
+
+def compute_ev(p_win: float, mc: dict, entry: float, direction: str, position_size) -> dict:
+    avg_win   = mc["avg_win"]
+    avg_loss  = abs(mc["avg_loss"])
+    var_95    = abs(mc["var_95_pct"])
+    b         = avg_win / (avg_loss + 1e-9)
+    kelly_f   = max(0.0, (b * p_win - (1 - p_win)) / b)
+    kelly_h   = kelly_f / 2  # half-Kelly
+
+    result = {
+        "ev_pct":            round(mc["ev_pct"] * 100, 2),
+        "avg_win_pct":       round(avg_win * 100, 2),
+        "avg_loss_pct":      round(-avg_loss * 100, 2),
+        "var_95_pct":        round(-var_95 * 100, 2),
+        "risk_reward_ratio": round(b, 2),
+        "kelly_half_pct":    round(kelly_h * 100, 1),
+    }
+
+    try:
+        ps = float(position_size) if position_size is not None else 0.0
+    except (TypeError, ValueError):
+        ps = 0.0
+    if ps > 0:
+        result.update({
+            "position_size":    round(ps, 2),
+            "ev_dollar":        round(mc["ev_pct"] * position_size, 2),
+            "avg_win_dollar":   round(avg_win * position_size, 2),
+            "avg_loss_dollar":  round(-avg_loss * position_size, 2),
+            "var_95_dollar":    round(-var_95 * position_size, 2),
+        })
+
+    return result
 
 
 def verdict(p: float) -> str:
@@ -605,3 +743,192 @@ def verdict(p: float) -> str:
     if p >= 0.40: return "Slight Disadvantage"
     if p >= 0.28: return "Unfavourable"
     return "Strong Disadvantage"
+
+
+SECTOR_PE = {
+    "Technology":28,"Information Technology":28,"Communication Services":22,
+    "Consumer Discretionary":20,"Consumer Staples":18,"Health Care":20,
+    "Healthcare":20,"Financials":13,"Financial Services":13,"Industrials":19,
+    "Energy":12,"Utilities":17,"Real Estate":22,"Materials":16,"Unknown":20,
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.api_route("/", methods=["GET","HEAD"])
+async def root():
+    return {"service": "TradeOdds API", "version": "2.0.0", "status": "ok", "docs": "/docs"}
+
+
+@app.get("/health")
+async def health():
+    return {"ok": True, "status": "ok", "provider": "twelvedata+yfinance",
+            "live_data": True, "version": "2.0", "time": datetime.utcnow().isoformat()+"Z"}
+
+
+@app.get("/v1/forecast")
+async def forecast(
+    ticker:        str   = Query(...),
+    horizon:       int   = Query(90),
+    dir:           str   = Query("long"),
+    entry:         float = Query(None),
+    position_size: float = Query(None, description="Dollar amount of position (optional)"),
+):
+    ticker    = ticker.upper().strip()
+    horizon   = max(1, min(horizon, 365))
+    direction = dir.lower()
+    if direction not in ("long","short"):
+        raise HTTPException(400, "dir must be 'long' or 'short'")
+
+    # Live price
+    cur = get_live_price(ticker)
+    if cur <= 0:
+        raise HTTPException(404, f"No price data for {ticker}")
+    entry_price = entry if (entry and entry > 0) else cur
+
+    # Data
+    try:
+        ohlcv = get_ohlcv(ticker)
+        fund  = get_fundamentals(ticker)
+        macro = get_macro()
+    except Exception as e:
+        raise HTTPException(502, str(e))
+
+    beta = float(fund.get("beta") or 1.0)
+
+    # Factor modules
+    tech    = module_technical(ohlcv, cur)
+    market  = module_market_factor(ohlcv, beta)
+    fundsc  = module_fundamentals(fund, cur)
+    modern  = module_modern_factors(fund)
+    sent    = module_sentiment(fund, cur)
+    vol     = module_vol_surface(ohlcv, beta, macro["vix"])
+
+    # Probability engine
+    weights = REGIME_WEIGHTS.get(macro["regime"], REGIME_WEIGHTS["neutral"])
+    br      = run_base_rate(ohlcv, direction, horizon)
+    ana     = run_analogues(ohlcv, direction, horizon, vol["realized_vol_60d"])
+    mc      = run_monte_carlo(cur, entry_price, direction, horizon,
+                              vol["implied_vol"], market["alpha_ann"])
+    ens     = run_ensemble(tech, market, fundsc, modern, sent,
+                           mc, br["base_rate"], ana, weights, direction)
+
+    p_win   = ens["p_ensemble"]
+    ev      = compute_ev(p_win, mc, entry_price, direction, position_size)
+
+    # Factor radar (0-10 per axis)
+    radar = {
+        "technical":  round(float(np.clip((tech["score"] + 1) * 5, 0, 10)), 1),
+        "quality":    round(float(fundsc["profitability"]), 1),
+        "growth":     round(float(fundsc["growth"]), 1),
+        "value":      round(float(fundsc["value"]), 1),
+        "momentum":   round(float(np.clip(tech["mom_12m"] * 100 / 30 + 5, 0, 10)), 1),
+        "modern":     round(float(np.clip((modern["score"] + 1) * 5, 0, 10)), 1),
+    }
+
+    implied_move_pct = round(vol["implied_vol"] * math.sqrt(horizon / 252) * 100, 1)
+
+    return {
+        "ticker":        ticker,
+        "name":          fund["name"],
+        "sector":        fund["sector"],
+        "industry":      fund["industry"],
+        "direction":     direction,
+        "horizon_days":  horizon,
+        "current_price": round(cur, 2),
+        "entry_price":   round(entry_price, 2),
+        "sector_pe":     SECTOR_PE.get(fund["sector"], 20),
+        "market_cap":    fund.get("market_cap"),
+
+        "p_win":        p_win,
+        "verdict":      verdict(p_win),
+        "ev":           ev,
+        "implied_move_pct": implied_move_pct,
+        "position_size": position_size,
+
+        "modules": {
+            "technicals":     tech,
+            "market_factor":  market,
+            "fundamentals":   fundsc,
+            "modern_factors": modern,
+            "sentiment":      sent,
+            "vol_surface":    vol,
+            "monte_carlo":    mc,
+            "base_rate":      br,
+            "analogues":      ana,
+            "ensemble":       ens,
+        },
+
+        "macro":        macro,
+        "factor_radar": radar,
+
+        "generated_at":  datetime.utcnow().isoformat() + "Z",
+        "model_version": "TradeOdds-v2.0 (7-Factor+MC-t5)",
+        "data_source":   "Twelve Data (live) + yfinance (fundamentals/macro)",
+    }
+
+
+SP500_SAMPLE = [
+    "AAPL","MSFT","NVDA","AMZN","GOOGL","META","LLY","AVGO","JPM",
+    "TSLA","UNH","V","XOM","MA","JNJ","PG","HD","COST","MRK","NFLX",
+]
+
+@app.get("/v1/screener/top")
+async def screener(limit: int = Query(10), dir: str = Query("long")):
+    direction = dir.lower()
+    results   = []
+    for tk in SP500_SAMPLE[:limit]:
+        try:
+            cur  = get_live_price(tk)
+            if cur <= 0:
+                continue
+            ohlcv = get_ohlcv(tk)
+            fund  = get_fundamentals(tk)
+            macro = get_macro()
+            beta  = float(fund.get("beta") or 1.0)
+            tech  = module_technical(ohlcv, cur)
+            mkt   = module_market_factor(ohlcv, beta)
+            fsc   = module_fundamentals(fund, cur)
+            mod   = module_modern_factors(fund)
+            snt   = module_sentiment(fund, cur)
+            vol   = module_vol_surface(ohlcv, beta, macro["vix"])
+            wts   = REGIME_WEIGHTS.get(macro["regime"], REGIME_WEIGHTS["neutral"])
+            br    = run_base_rate(ohlcv, direction, 90)
+            ana   = run_analogues(ohlcv, direction, 90, vol["realized_vol_60d"])
+            mc    = run_monte_carlo(cur, cur, direction, 90, vol["implied_vol"], mkt["alpha_ann"])
+            ens   = run_ensemble(tech, mkt, fsc, mod, snt, mc, br["base_rate"], ana, wts, direction)
+            results.append({
+                "ticker": tk, "name": fund["name"], "sector": fund["sector"],
+                "p_win": ens["p_ensemble"], "verdict": verdict(ens["p_ensemble"]),
+                "current_price": round(cur, 2),
+                "alpha_ann": mkt["alpha_ann"], "mom_12m": tech["mom_12m"],
+            })
+        except Exception:
+            continue
+
+    results.sort(key=lambda x: x["p_win"], reverse=(direction == "long"))
+    return {"direction": direction, "results": results,
+            "screened_at": datetime.utcnow().isoformat() + "Z"}
+
+
+@app.get("/v1/calibration")
+async def calibration():
+    return {
+        "model": "TradeOdds-v2.0",
+        "factor_modules": [
+            "Technical & Price Dynamics",
+            "Market Factor Regression (CAPM alpha)",
+            "Fundamental Quality Score",
+            "Modern Company Factors (R&D, platform, moat)",
+            "Sentiment & Positioning",
+            "Macro Regime (VIX + yield curve + SPY trend)",
+            "Volatility Surface (realized + implied)",
+        ],
+        "monte_carlo": "Student-t df=5 (fat tails), 10,000 paths",
+        "regime_model": "5-state: bull/bear × low/normal/high vol",
+        "ensemble": "40% MC + 60% factor blend (regime-weighted)",
+        "data": "Twelve Data (live price + OHLCV) + yfinance (fundamentals + macro)",
+        "note": "Statistical analysis only. Not financial advice.",
+    }
