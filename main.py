@@ -538,7 +538,14 @@ async def calibration():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "time": datetime.utcnow().isoformat() + "Z"}
+    return {
+        "ok": True,
+        "status": "ok",
+        "provider": "yfinance",
+        "live_data": True,
+        "version": "1.0",
+        "time": datetime.utcnow().isoformat() + "Z",
+    }
 
 
 def verdict(p: float) -> str:
