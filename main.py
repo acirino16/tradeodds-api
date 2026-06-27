@@ -557,7 +557,7 @@ async def calibration():
     }
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 async def root():
     return {"service": "TradeOdds API", "status": "ok", "docs": "/docs"}
 
