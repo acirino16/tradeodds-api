@@ -736,7 +736,7 @@ def calibration_report(df: pd.DataFrame) -> str:
     lines.append(f"{'='*60}")
     lines.append(f"Total predictions:  {n_total}")
     lines.append(f"Tickers:            {resolved['ticker'].nunique()}")
-    lines.append(f"Date range:         {resolved['as_of'].min()} → {resolved['as_of'].max()}")
+    lines.append(f"Date range:         {resolved['as_of'].min()} to {resolved['as_of'].max()}")
     if "regime" in resolved.columns:
         regime_counts = resolved["regime"].value_counts().to_dict()
         lines.append(f"Regimes seen:       {dict(regime_counts)}")
@@ -1037,15 +1037,16 @@ def main():
 
     df = pd.DataFrame(rows)
     df.to_csv(args.out, index=False)
-    print(f"  Saved → {args.out}")
+    print(f"  Saved -> {args.out}")
 
     report = calibration_report(df)
     report_file = args.out.replace(".csv", "_report.txt")
-    with open(report_file, "w") as f:
+    with open(report_file, "w", encoding="utf-8") as f:
         f.write(report)
-    print(f"  Report → {report_file}")
+    print(f"  Report -> {report_file}")
     print()
-    print(report)
+    sys.stdout.buffer.write(report.encode("utf-8", errors="replace"))
+    sys.stdout.buffer.write(b"\n")
 
 
 if __name__ == "__main__":
