@@ -42,29 +42,66 @@ warnings.filterwarnings("ignore")
 
 # ── Universe ───────────────────────────────────────────────────────────────────
 DEFAULT_TICKERS = [
-    # Tech / Growth
-    "AAPL", "MSFT", "NVDA", "GOOGL", "META", "AVGO", "AMD", "CRM",
-    # Consumer / Retail
-    "AMZN", "TSLA", "HD", "COST", "NKE",
+    # Mega-cap tech
+    "AAPL","MSFT","NVDA","GOOGL","META","AVGO","AMD","CRM","INTC","QCOM",
+    "TXN","MU","NOW","ADBE","ORCL","IBM","AMAT","KLAC","LRCX","MRVL",
+    # High-growth / cloud
+    "SNOW","PLTR","UBER","ABNB","SHOP","NET","DDOG","CRWD","ZS","OKTA",
+    "SMCI","ROKU","SNAP",
+    # Consumer discretionary
+    "AMZN","TSLA","HD","NKE","BKNG","SBUX","MCD","TGT","LOW","GM","F",
+    "RIVN","DASH","LYFT",
+    # Consumer staples
+    "COST","PG","KO","PEP","WMT","CL","MDLZ",
     # Financials
-    "JPM", "BAC", "GS",
-    # Healthcare
-    "UNH", "LLY", "JNJ",
-    # Energy / Industrial
-    "XOM", "CAT", "GE",
-    # Defensive
-    "PG", "KO", "MRK",
-    # Small / mid volatile
-    "SMCI", "ROKU", "SNAP",
+    "JPM","BAC","GS","MS","C","WFC","BLK","V","MA","PYPL","AXP","SCHW",
+    # Healthcare / biotech
+    "UNH","LLY","JNJ","ABBV","BMY","PFE","AMGN","GILD","ISRG","CVS","TMO","DHR",
+    # Energy
+    "XOM","CVX","OXY","SLB","COP",
+    # Industrials / defence
+    "CAT","GE","BA","RTX","LMT","HON","UPS","FDX","DE",
+    # Communication
+    "DIS","NFLX","T","VZ",
+    # Materials
+    "FCX","NEM","LIN",
+    # Defensive / other
+    "MRK","AMT","PLD",
 ]
 
 # Sector ETF mapping — used for cross-sectional relative momentum (improvement 2)
 TICKER_SECTOR_ETF = {
-    "AAPL":"XLK","MSFT":"XLK","NVDA":"XLK","GOOGL":"XLC","META":"XLC",
-    "AVGO":"XLK","AMD":"XLK","CRM":"XLK","AMZN":"XLY","TSLA":"XLY",
-    "HD":"XLY","COST":"XLP","NKE":"XLY","JPM":"XLF","BAC":"XLF","GS":"XLF",
-    "UNH":"XLV","LLY":"XLV","JNJ":"XLV","XOM":"XLE","CAT":"XLI","GE":"XLI",
-    "PG":"XLP","KO":"XLP","MRK":"XLV","SMCI":"XLK","ROKU":"XLC","SNAP":"XLC",
+    # Tech (XLK)
+    "AAPL":"XLK","MSFT":"XLK","NVDA":"XLK","AVGO":"XLK","AMD":"XLK",
+    "CRM":"XLK","INTC":"XLK","QCOM":"XLK","TXN":"XLK","MU":"XLK",
+    "NOW":"XLK","ADBE":"XLK","ORCL":"XLK","IBM":"XLK","AMAT":"XLK",
+    "KLAC":"XLK","LRCX":"XLK","MRVL":"XLK","SMCI":"XLK",
+    "SNOW":"XLK","PLTR":"XLK","NET":"XLK","DDOG":"XLK","CRWD":"XLK",
+    "ZS":"XLK","OKTA":"XLK",
+    # Communication (XLC)
+    "GOOGL":"XLC","META":"XLC","ROKU":"XLC","SNAP":"XLC",
+    "DIS":"XLC","NFLX":"XLC","T":"XLC","VZ":"XLC",
+    # Consumer Discretionary (XLY)
+    "AMZN":"XLY","TSLA":"XLY","HD":"XLY","NKE":"XLY","BKNG":"XLY",
+    "SBUX":"XLY","MCD":"XLY","TGT":"XLY","LOW":"XLY","GM":"XLY","F":"XLY",
+    "RIVN":"XLY","DASH":"XLY","LYFT":"XLY","UBER":"XLY","ABNB":"XLY","SHOP":"XLY",
+    # Consumer Staples (XLP)
+    "COST":"XLP","PG":"XLP","KO":"XLP","PEP":"XLP","WMT":"XLP","CL":"XLP","MDLZ":"XLP",
+    # Financials (XLF)
+    "JPM":"XLF","BAC":"XLF","GS":"XLF","MS":"XLF","C":"XLF","WFC":"XLF",
+    "BLK":"XLF","V":"XLF","MA":"XLF","PYPL":"XLF","AXP":"XLF","SCHW":"XLF",
+    # Healthcare (XLV)
+    "UNH":"XLV","LLY":"XLV","JNJ":"XLV","ABBV":"XLV","BMY":"XLV","PFE":"XLV",
+    "AMGN":"XLV","GILD":"XLV","ISRG":"XLV","CVS":"XLV","TMO":"XLV","DHR":"XLV","MRK":"XLV",
+    # Energy (XLE)
+    "XOM":"XLE","CVX":"XLE","OXY":"XLE","SLB":"XLE","COP":"XLE",
+    # Industrials (XLI)
+    "CAT":"XLI","GE":"XLI","BA":"XLI","RTX":"XLI","LMT":"XLI",
+    "HON":"XLI","UPS":"XLI","FDX":"XLI","DE":"XLI",
+    # Materials (XLK as proxy — no XLB in our ETF set)
+    "FCX":"XLK","NEM":"XLK","LIN":"XLK",
+    # Real estate / other (XLF as proxy)
+    "AMT":"XLF","PLD":"XLF",
 }
 SECTOR_ETFS = list(set(TICKER_SECTOR_ETF.values()))  # XLK, XLC, XLY, XLP, XLF, XLV, XLE, XLI
 

@@ -18,8 +18,15 @@ from fastapi.middleware.cors import CORSMiddleware
 import yfinance as yf
 import numpy as np
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 import math, time, os, requests, warnings
+
+# EDGAR modules — point-in-time fundamentals + insider scoring
+try:
+    from edgar import get_insider_score as _edgar_insider_score
+    _EDGAR_AVAILABLE = True
+except Exception:
+    _EDGAR_AVAILABLE = False
 
 warnings.filterwarnings("ignore")
 
@@ -315,6 +322,69 @@ def module_technical(df: pd.DataFrame, cur: float) -> dict:
         "low_52w":          round(float(low52), 2),
         "vol_ratio":        round(float(vol_ratio), 3),
     }
+
+
+def module_volume(df: pd.DataFrame) -> dict:
+    """Volume confirmation — OBV trend, volume expansion, up/down volume ratio."""
+    closes  = df["close"].values.astype(float)
+    volumes = df["volume"].values.astype(float)
+    volumes = np.where(volumes < 1, 1.0, volumes)
+
+    if len(closes) < 25:
+        return {"score": 0.0, "obv_trend": 0.0, "vol_expansion": 1.0, "ud_ratio": 1.0}
+
+    daily_ret = np.diff(closes)
+    signs     = np.sign(daily_ret)
+    obv       = np.cumsum(signs * volumes[1:])
+    obv_recent = obv[-20:]
+    obv_mean   = np.mean(np.abs(obv_recent)) + 1
+    x = np.arange(len(obv_recent))
+    slope = float(np.polyfit(x, obv_recent, 1)[0]) / obv_mean
+    obv_score = float(np.clip(slope * 50, -1, 1))
+
+    vol_5  = float(np.mean(volumes[-5:]))
+    vol_20 = float(np.mean(volumes[-20:]))
+    vol_ratio = vol_5 / (vol_20 + 1e-9)
+    vol_score = float(np.clip((vol_ratio - 1.0) / 0.5, -1, 1))
+
+    rets_20 = daily_ret[-20:]
+    vols_20 = volumes[-20:][-len(rets_20):]
+    up_mask   = rets_20 > 0
+    down_mask = rets_20 < 0
+    up_vol   = float(np.mean(vols_20[up_mask]))   if up_mask.any()   else vol_20
+    down_vol = float(np.mean(vols_20[down_mask])) if down_mask.any() else vol_20
+    ud_ratio = up_vol / (down_vol + 1e-9)
+    ud_score = float(np.clip((ud_ratio - 1.0) / 0.5, -1, 1))
+
+    score = 0.40 * obv_score + 0.35 * vol_score + 0.25 * ud_score
+    return {
+        "score":         round(float(np.clip(score, -1, 1)), 4),
+        "obv_trend":     round(obv_score, 4),
+        "vol_expansion": round(vol_ratio, 3),
+        "ud_ratio":      round(ud_ratio, 3),
+    }
+
+
+# In-memory insider score cache (monthly granularity — refreshed weekly on Render)
+_insider_cache: dict = {}
+
+def module_insider(ticker: str) -> dict:
+    """Insider transaction score from SEC EDGAR Form 4 filings (last 90 days)."""
+    global _insider_cache
+    cache_key = (ticker.upper(), datetime.utcnow().strftime("%Y-%m"))
+    if cache_key in _insider_cache:
+        return _insider_cache[cache_key]
+
+    score = 0.0
+    if _EDGAR_AVAILABLE:
+        try:
+            score = _edgar_insider_score(ticker, datetime.utcnow(), lookback_days=90)
+        except Exception:
+            score = 0.0
+
+    result = {"score": round(score, 4), "signal": "buying" if score > 0.1 else "selling" if score < -0.1 else "neutral"}
+    _insider_cache[cache_key] = result
+    return result
 
 
 def module_market_factor(df: pd.DataFrame, beta: float) -> dict:
@@ -647,38 +717,46 @@ def run_ensemble(
     tech, market, fund, modern, sent,
     mc, base_rate, analogues,
     weights: dict, direction: str,
+    volume_score: float = 0.0,
+    insider_score: float = 0.0,
 ) -> dict:
     """
-    Blend all 7 factor modules + MC + base rate + analogues into one
-    calibrated probability. Factor scores convert via sigmoid; MC and
-    historical rates are direct probabilities.
+    Blend all factor modules into one calibrated probability.
+    v2.1: adds volume confirmation and insider transaction signal.
     """
     d = 1 if direction == "long" else -1
 
-    def s2p(s):  # score (-1,+1) → probability (0.10, 0.90)
-        return float(np.clip(0.50 + float(s) * d * 0.35, 0.10, 0.90))
+    def s2p(s):  # score (-1,+1) → probability
+        return float(np.clip(0.50 + float(s) * d * 0.18, 0.22, 0.78))
 
-    p_tech   = s2p(tech["score"])
-    p_mkt    = s2p(market["score"])
-    p_fund   = s2p(fund["score"])
-    p_mod    = s2p(modern["score"])
-    p_sent   = s2p(sent["score"])
-    p_base   = base_rate if direction == "long" else (1 - base_rate)
-    p_ana    = analogues["analogue_p"]
-    p_mc     = mc["p_mc"]
+    p_tech    = s2p(tech["score"])
+    p_mkt     = s2p(market["score"])
+    p_fund    = s2p(fund["score"])
+    p_mod     = s2p(modern["score"])
+    p_sent    = s2p(sent["score"])
+    p_vol_sig = s2p(volume_score)
+    p_insider = s2p(insider_score)
+    p_base    = base_rate if direction == "long" else (1 - base_rate)
+    p_ana     = analogues["analogue_p"]
+    p_mc      = mc["p_mc"]
 
+    # Volume and insider each take 5% from technical and sentiment
     factor_blend = (
-        weights["technical"]   * p_tech +
-        weights["market"]      * p_mkt  +
-        weights["fundamental"] * p_fund +
-        weights["modern"]      * p_mod  +
-        weights["sentiment"]   * p_sent +
-        weights["base_rate"]   * p_base +
-        weights["analogues"]   * p_ana
+        weights["technical"]   * 0.90 * p_tech    +
+        weights["market"]               * p_mkt    +
+        weights["fundamental"]          * p_fund   +
+        weights["modern"]               * p_mod    +
+        weights["sentiment"]   * 0.90 * p_sent    +
+        weights["base_rate"]            * p_base   +
+        weights["analogues"]            * p_ana    +
+        weights["technical"]   * 0.05 * p_vol_sig +
+        weights["sentiment"]   * 0.05 * p_insider
     )
 
-    # MC carries 40% of final weight — it integrates drift, vol, and fat tails
     final = float(np.clip(0.40 * p_mc + 0.60 * factor_blend, 0.05, 0.95))
+
+    # Shrinkage toward 0.50 (calibrated from backtest)
+    final = 0.50 + (final - 0.50) * 0.68
 
     all_p  = [p_tech, p_mkt, p_fund, p_mod, p_sent, p_base, p_ana, p_mc]
     spread = float(np.max(all_p) - np.min(all_p))
@@ -698,6 +776,8 @@ def run_ensemble(
             "base_rate":     round(p_base, 4),
             "analogues":     round(p_ana, 4),
             "monte_carlo":   round(p_mc, 4),
+            "volume":        round(p_vol_sig, 4),
+            "insider":       round(p_insider, 4),
         },
         "weights": weights,
     }
@@ -805,6 +885,8 @@ async def forecast(
     modern  = module_modern_factors(fund)
     sent    = module_sentiment(fund, cur)
     vol     = module_vol_surface(ohlcv, beta, macro["vix"])
+    volume  = module_volume(ohlcv)
+    insider = module_insider(ticker)
 
     # Probability engine
     weights = REGIME_WEIGHTS.get(macro["regime"], REGIME_WEIGHTS["neutral"])
@@ -813,10 +895,26 @@ async def forecast(
     mc      = run_monte_carlo(cur, entry_price, direction, horizon,
                               vol["implied_vol"], market["alpha_ann"])
     ens     = run_ensemble(tech, market, fundsc, modern, sent,
-                           mc, br["base_rate"], ana, weights, direction)
+                           mc, br["base_rate"], ana, weights, direction,
+                           volume["score"], insider["score"])
 
     p_win   = ens["p_ensemble"]
     ev      = compute_ev(p_win, mc, entry_price, direction, position_size)
+
+    # Regime favorability flag — core commercialisation signal
+    BULL_REGIMES = {"bull_low_vol", "bull_normal", "bull_high_vol"}
+    BEAR_REGIMES = {"bear_normal", "bear_high_vol"}
+    regime       = macro["regime"]
+    regime_favorable = (
+        (direction == "long"  and regime in BULL_REGIMES) or
+        (direction == "short" and regime in BEAR_REGIMES)
+    )
+    regime_warning = None
+    if not regime_favorable:
+        if direction == "long" and regime in BEAR_REGIMES:
+            regime_warning = "Bear market regime detected — long trades have historically lower win rates in this environment."
+        elif direction == "short" and regime in BULL_REGIMES:
+            regime_warning = "Bull market regime detected — short trades face a macro headwind in this environment."
 
     # Factor radar (0-10 per axis)
     radar = {
@@ -826,6 +924,8 @@ async def forecast(
         "value":      round(float(fundsc["value"]), 1),
         "momentum":   round(float(np.clip(tech["mom_12m"] * 100 / 30 + 5, 0, 10)), 1),
         "modern":     round(float(np.clip((modern["score"] + 1) * 5, 0, 10)), 1),
+        "volume":     round(float(np.clip((volume["score"] + 1) * 5, 0, 10)), 1),
+        "insider":    round(float(np.clip((insider["score"] + 1) * 5, 0, 10)), 1),
     }
 
     implied_move_pct = round(vol["implied_vol"] * math.sqrt(horizon / 252) * 100, 1)
@@ -842,11 +942,13 @@ async def forecast(
         "sector_pe":     SECTOR_PE.get(fund["sector"], 20),
         "market_cap":    fund.get("market_cap"),
 
-        "p_win":        p_win,
-        "verdict":      verdict(p_win),
-        "ev":           ev,
-        "implied_move_pct": implied_move_pct,
-        "position_size": position_size,
+        "p_win":             p_win,
+        "verdict":           verdict(p_win),
+        "ev":                ev,
+        "implied_move_pct":  implied_move_pct,
+        "position_size":     position_size,
+        "regime_favorable":  regime_favorable,
+        "regime_warning":    regime_warning,
 
         "modules": {
             "technicals":     tech,
@@ -855,6 +957,8 @@ async def forecast(
             "modern_factors": modern,
             "sentiment":      sent,
             "vol_surface":    vol,
+            "volume":         volume,
+            "insider":        insider,
             "monte_carlo":    mc,
             "base_rate":      br,
             "analogues":      ana,
@@ -865,7 +969,7 @@ async def forecast(
         "factor_radar": radar,
 
         "generated_at":  datetime.utcnow().isoformat() + "Z",
-        "model_version": "TradeOdds-v2.0 (7-Factor+MC-t5)",
+        "model_version": "TradeOdds-v2.1 (9-Factor+MC-t5+RegimeGate)",
         "data_source":   "Twelve Data (live) + yfinance (fundamentals/macro)",
     }
 
