@@ -62,8 +62,11 @@ def store(key: str, val):
 # DATA LAYER
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def get_live_price(ticker: str) -> float:
-    """Real-time price: Twelve Data primary, yfinance fallback."""
+def get_live_price(ticker: str) -> tuple[float, str, str]:
+    """Real-time price: Twelve Data primary, yfinance fallback.
+    Returns (price, source, price_as_of_iso).
+    """
+    now_iso = datetime.utcnow().isoformat() + "Z"
     if TWELVEDATA_KEY:
         try:
             r = _session.get(
@@ -71,15 +74,30 @@ def get_live_price(ticker: str) -> float:
                 params={"symbol": ticker, "apikey": TWELVEDATA_KEY},
                 timeout=8,
             )
-            price = float(r.json().get("price", 0))
+            data = r.json()
+            # Twelve Data returns {"price": "..."} on success, {"code":..,"message":...} on error
+            if "code" in data or "message" in data:
+                raise ValueError(data.get("message", "Twelve Data error"))
+            price = float(data.get("price", 0))
             if price > 0:
-                return price
+                return price, "twelvedata_live", now_iso
         except Exception:
             pass
+    # yfinance fallback — last_price is last trade, may be prior close outside market hours
     try:
-        return float(yf.Ticker(ticker, session=_session).fast_info.last_price)
+        info = yf.Ticker(ticker, session=_session).fast_info
+        price = float(info.last_price)
+        # Approximate staleness: yfinance doesn't expose price timestamp directly
+        import pytz
+        from datetime import timezone
+        now_et = datetime.now(pytz.timezone("America/New_York"))
+        market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+        market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+        is_market_hours = market_open <= now_et <= market_close and now_et.weekday() < 5
+        source = "yfinance_live" if is_market_hours else "yfinance_prior_close"
+        return price, source, now_iso
     except Exception:
-        return 0.0
+        return 0.0, "unavailable", now_iso
 
 
 def get_ohlcv(ticker: str) -> pd.DataFrame:
@@ -863,7 +881,7 @@ async def forecast(
         raise HTTPException(400, "dir must be 'long' or 'short'")
 
     # Live price
-    cur = get_live_price(ticker)
+    cur, price_source, price_as_of = get_live_price(ticker)
     if cur <= 0:
         raise HTTPException(404, f"No price data for {ticker}")
     entry_price = entry if (entry and entry > 0) else cur
@@ -978,6 +996,9 @@ async def forecast(
         "factor_radar": radar,
 
         "generated_at":  datetime.utcnow().isoformat() + "Z",
+        "price_as_of":   price_as_of,
+        "price_source":  price_source,
+        "price_stale":   price_source == "yfinance_prior_close",
         "model_version": "TradeOdds-v2.1 (9-Factor+MC-t5+RegimeGate)",
         "data_source":   "Twelve Data (live) + yfinance (fundamentals/macro)",
     }
@@ -994,7 +1015,7 @@ async def screener(limit: int = Query(10), dir: str = Query("long")):
     results   = []
     for tk in SP500_SAMPLE[:limit]:
         try:
-            cur  = get_live_price(tk)
+            cur, _, _ = get_live_price(tk)
             if cur <= 0:
                 continue
             ohlcv = get_ohlcv(tk)
