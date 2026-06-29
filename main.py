@@ -916,6 +916,14 @@ async def forecast(
         elif direction == "short" and regime in BULL_REGIMES:
             regime_warning = "Bull market regime detected — short trades face a macro headwind in this environment."
 
+    # Recommended horizon based on 5-year backtest findings (180d longs 71%, 60d shorts faster)
+    HORIZON_BY_REGIME = {
+        "bull_low_vol":  180, "bull_normal": 180, "bull_high_vol": 120,
+        "bear_normal":    60, "bear_high_vol": 45,
+        "neutral":        90,
+    }
+    recommended_horizon = HORIZON_BY_REGIME.get(regime, 90)
+
     # Factor radar (0-10 per axis)
     radar = {
         "technical":  round(float(np.clip((tech["score"] + 1) * 5, 0, 10)), 1),
@@ -947,8 +955,9 @@ async def forecast(
         "ev":                ev,
         "implied_move_pct":  implied_move_pct,
         "position_size":     position_size,
-        "regime_favorable":  regime_favorable,
-        "regime_warning":    regime_warning,
+        "regime_favorable":    regime_favorable,
+        "regime_warning":      regime_warning,
+        "recommended_horizon": recommended_horizon,
 
         "modules": {
             "technicals":     tech,
