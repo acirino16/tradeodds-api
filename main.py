@@ -130,18 +130,28 @@ def get_ohlcv(ticker: str) -> pd.DataFrame:
         except Exception:
             pass
 
-    try:
-        raw = yf.download(ticker, period="2y", progress=False, auto_adjust=True, session=_session)
-        if not raw.empty:
-            df = raw.reset_index()
-            df.columns = ["date","open","high","low","close","volume"] if len(df.columns) == 6 else df.columns
-            df = df.rename(columns={df.columns[0]: "date"})
-            cols = {c: c.lower() for c in df.columns}
-            df = df.rename(columns=cols)
-            df = df[["date","open","high","low","close","volume"]].dropna(subset=["close"])
-            return store(key, df)
-    except Exception:
-        pass
+    # yfinance fallback — use Ticker.history() which is more reliable on cloud hosts
+    # than yf.download() which gets rate-limited
+    for attempt in range(2):
+        try:
+            tk = yf.Ticker(ticker)
+            raw = tk.history(period="2y", auto_adjust=True, actions=False)
+            if not raw.empty:
+                df = raw.reset_index()
+                df.columns = [c.lower() for c in df.columns]
+                df = df.rename(columns={"datetime": "date", "index": "date"})
+                if "date" not in df.columns and df.columns[0] != "date":
+                    df = df.rename(columns={df.columns[0]: "date"})
+                df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
+                for c in ["open", "high", "low", "close", "volume"]:
+                    if c in df.columns:
+                        df[c] = pd.to_numeric(df[c], errors="coerce")
+                keep = [c for c in ["date","open","high","low","close","volume"] if c in df.columns]
+                df = df[keep].dropna(subset=["close"]).reset_index(drop=True)
+                if len(df) > 50:
+                    return store(key, df)
+        except Exception:
+            pass
 
     raise HTTPException(502, f"Could not fetch price history for {ticker}")
 
