@@ -866,6 +866,36 @@ async def health():
             "live_data": True, "version": "2.0", "time": datetime.utcnow().isoformat()+"Z"}
 
 
+@app.get("/v1/price/{ticker}")
+async def price_quote(ticker: str):
+    """Lightweight price endpoint — used by frontend to get live quotes for the local simulator."""
+    ticker = ticker.upper().strip()
+    price, source, as_of = get_live_price(ticker)
+    if price <= 0:
+        raise HTTPException(404, f"No price data for {ticker}")
+    return {
+        "ticker":   ticker,
+        "price":    round(price, 2),
+        "source":   source,
+        "as_of":    as_of,
+        "stale":    source == "yfinance_prior_close",
+    }
+
+
+@app.get("/v1/price")
+async def price_batch(tickers: str = Query(...)):
+    """Batch price endpoint — comma-separated tickers, e.g. ?tickers=AAPL,TSLA,NVDA"""
+    results = {}
+    for tk in [t.strip().upper() for t in tickers.split(",") if t.strip()][:50]:
+        try:
+            price, source, as_of = get_live_price(tk)
+            if price > 0:
+                results[tk] = {"price": round(price, 2), "source": source, "stale": source == "yfinance_prior_close"}
+        except Exception:
+            pass
+    return {"prices": results, "count": len(results)}
+
+
 @app.get("/v1/forecast")
 async def forecast(
     ticker:        str   = Query(...),
